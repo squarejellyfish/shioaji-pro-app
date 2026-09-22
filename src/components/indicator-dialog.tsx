@@ -30,6 +30,7 @@ import {
     INDICATOR_DEFS,
     loadFavorites,
     outputStyle,
+    resolveParams,
     saveFavorites,
     saveTypeDefault,
     type IndicatorDef,
@@ -450,6 +451,7 @@ function ColorPanel({
 export function IndicatorSettingsModal({
     inst,
     timeframes,
+    tfMinutes,
     onPatch,
     onRemove,
     onCommit,
@@ -457,6 +459,7 @@ export function IndicatorSettingsModal({
 }: {
     inst: IndicatorInstance;
     timeframes: { label: string; minutes: number }[];
+    tfMinutes: number; // 目前圖表所在時框 — 參數輸入是這個時框專屬的
     onPatch: (patch: Partial<IndicatorInstance>) => void;
     onRemove: () => void;
     onCommit: (patch?: Partial<IndicatorInstance>) => void;
@@ -471,28 +474,50 @@ export function IndicatorSettingsModal({
     const [plotFor, setPlotFor] = useState<string | null>(null);
     const [defaultsOpen, setDefaultsOpen] = useState(false);
     const [savedTip, setSavedTip] = useState(false);
+    const tfLabel = timeframes.find((t) => t.minutes === tfMinutes)?.label ?? `${tfMinutes}分`;
+    const hasTfOverride = !!inst.paramsByTf?.[tfMinutes];
 
     // 參數輸入框：只在本地暫存文字，不即時 onPatch — 避免每個 keystroke
     // 都把超出範圍的中間值夾回 min/max，導致打不出 min/max 以外的數字
     // （例如 min=20 時打「1」會立刻被夾成「20」）。只在按下「確定」時
     // 才把暫存值 clamp 後一次套用並送出。
+    //
+    // 參數本身也是「這個時框專屬」的（見 indicator-defs.ts 的
+    // resolveParams）——暫存內容初始化自目前時框已解析出的值（覆寫過
+    // 就是覆寫值，沒覆寫就是共用預設），「確定」時寫回
+    // paramsByTf[tfMinutes]，不影響其他時框。
     const buildParamDraft = (params: Record<string, number>) =>
         Object.fromEntries(
             (def?.params ?? []).map((p) => [p.key, String(params[p.key] ?? p.def)]),
         );
     const [paramDraft, setParamDraft] = useState<Record<string, string>>(() =>
-        buildParamDraft(inst.params),
+        buildParamDraft(def ? resolveParams(inst, def, tfMinutes) : inst.params),
     );
     const resolvedParams = (): Record<string, number> => {
-        const out: Record<string, number> = { ...inst.params };
+        const base = def ? resolveParams(inst, def, tfMinutes) : inst.params;
+        const out: Record<string, number> = { ...base };
         for (const p of def?.params ?? []) {
             const raw = paramDraft[p.key];
             const v = raw === undefined ? NaN : Number(raw);
             out[p.key] = Number.isFinite(v)
                 ? Math.min(p.max, Math.max(p.min, v))
-                : (inst.params[p.key] ?? p.def);
+                : (base[p.key] ?? p.def);
         }
         return out;
+    };
+    // 若最後結果跟共用預設完全一樣，直接移除這個時框的覆寫（而不是存
+    // 一份內容相同的覆寫），這樣「還原為共用預設」按確定後才會真的
+    // 讓 hasTfOverride 變回 false
+    const commitParamsByTf = (): Record<number, Record<string, number>> | undefined => {
+        if (!def) return inst.paramsByTf;
+        const finalParams = resolvedParams();
+        const matchesBase = def.params.every(
+            (p) => finalParams[p.key] === (inst.params[p.key] ?? p.def),
+        );
+        const next = { ...inst.paramsByTf };
+        if (matchesBase) delete next[tfMinutes];
+        else next[tfMinutes] = finalParams;
+        return Object.keys(next).length > 0 ? next : undefined;
     };
 
     useEscClose(onCancel);
@@ -569,6 +594,34 @@ export function IndicatorSettingsModal({
                     </button>
                 </div>
                 <div className={styles.settingsBody}>
+                    {tab === 'inputs' && def.params.length > 0 && (
+                        <div className={styles.tfParamNote}>
+                            <span>
+                                參數僅套用於「{tfLabel}」，其他時框各自獨立
+                                {hasTfOverride ? '（此時框已自訂）' : ''}
+                            </span>
+                            {hasTfOverride && (
+                                <button
+                                    type='button'
+                                    className={styles.tfParamRevert}
+                                    onClick={() =>
+                                        setParamDraft(
+                                            buildParamDraft(
+                                                Object.fromEntries(
+                                                    def.params.map((p) => [
+                                                        p.key,
+                                                        inst.params[p.key] ?? p.def,
+                                                    ]),
+                                                ),
+                                            ),
+                                        )
+                                    }
+                                >
+                                    還原為共用預設
+                                </button>
+                            )}
+                        </div>
+                    )}
                     {tab === 'inputs' &&
                         def.params.map((p) => (
                             <label key={p.key} className={styles.fieldRow}>
@@ -819,6 +872,7 @@ export function IndicatorSettingsModal({
                                         const f = factoryInstance(inst);
                                         onPatch({
                                             params: f.params,
+                                            paramsByTf: undefined,
                                             colors: f.colors,
                                             styles: undefined,
                                             precision: undefined,
@@ -868,7 +922,7 @@ export function IndicatorSettingsModal({
                         </button>
                         <button
                             className={styles.okBtn}
-                            onClick={() => onCommit({ params: resolvedParams() })}
+                            onClick={() => onCommit({ paramsByTf: commitParamsByTf() })}
                         >
                             確定
                         </button>

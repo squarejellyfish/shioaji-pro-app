@@ -489,7 +489,10 @@ export interface OutputStyle {
 export interface IndicatorInstance {
     id: string;
     type: string;
+    // 沒有 paramsByTf 覆寫的時框都用這份（tf-agnostic 的預設值）
     params: Record<string, number>;
+    // tf minutes -> 該時框專用的參數；每個時框各自獨立、互不影響
+    paramsByTf?: Record<number, Record<string, number>>;
     // output key -> color override（legacy，讀取時遷移到 styles）
     colors: Record<string, string>;
     // output key -> style overrides
@@ -500,6 +503,19 @@ export interface IndicatorInstance {
     precision?: number; // 數值小數位數；undefined = 自動
     showLabels?: boolean; // 價格軸最新值標籤（預設 false）
     showValues?: boolean; // legend 顯示數值（預設 true）
+}
+
+// 依目前時框解出實際套用的參數：該時框有覆寫就用覆寫，否則退回共用預設，
+// 缺的 key 再退回指標定義的內建值
+export function resolveParams(
+    inst: IndicatorInstance,
+    def: IndicatorDef,
+    tfMinutes: number,
+): Record<string, number> {
+    const scoped = inst.paramsByTf?.[tfMinutes] ?? inst.params;
+    const out: Record<string, number> = {};
+    for (const p of def.params) out[p.key] = scoped[p.key] ?? p.def;
+    return out;
 }
 
 // merged effective style for one output
@@ -534,10 +550,13 @@ export function colorWithOpacity(hex: string, opacity: number): string {
     return `rgba(${r}, ${g}, ${b}, ${(opacity / 100).toFixed(2)})`;
 }
 
-export function instanceLabel(inst: IndicatorInstance): string {
+// tfMinutes 省略時用 tf-agnostic 的共用預設（例如指標選單裡還沒選時框的
+// 情境）；傳入時框則顯示該時框實際套用（可能被覆寫過）的參數
+export function instanceLabel(inst: IndicatorInstance, tfMinutes?: number): string {
     const def = DEF_BY_TYPE.get(inst.type);
     if (!def) return inst.type;
-    const args = def.params.map((p) => inst.params[p.key] ?? p.def);
+    const params = tfMinutes === undefined ? undefined : resolveParams(inst, def, tfMinutes);
+    const args = def.params.map((p) => params?.[p.key] ?? inst.params[p.key] ?? p.def);
     return args.length > 0 ? `${def.short}(${args.join(',')})` : def.short;
 }
 
@@ -551,6 +570,7 @@ export function newInstance(type: string): IndicatorInstance {
         type,
         params: { ...params, ...saved?.params },
         colors: {},
+        ...(saved?.paramsByTf ? { paramsByTf: saved.paramsByTf } : {}),
         ...(saved?.styles ? { styles: saved.styles } : {}),
         ...(saved?.precision !== undefined
             ? { precision: saved.precision }
@@ -575,6 +595,7 @@ export function duplicateInstance(inst: IndicatorInstance): IndicatorInstance {
 
 export interface TypeDefaults {
     params?: Record<string, number>;
+    paramsByTf?: Record<number, Record<string, number>>;
     styles?: Record<string, OutputStyle>;
     precision?: number;
     showLabels?: boolean;
@@ -597,6 +618,7 @@ export function saveTypeDefault(inst: IndicatorInstance) {
     const all = loadTypeDefaults();
     all[inst.type] = {
         params: inst.params,
+        ...(inst.paramsByTf ? { paramsByTf: inst.paramsByTf } : {}),
         ...(inst.styles ? { styles: inst.styles } : {}),
         ...(inst.precision !== undefined ? { precision: inst.precision } : {}),
         ...(inst.showLabels !== undefined

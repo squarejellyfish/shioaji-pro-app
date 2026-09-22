@@ -20,6 +20,7 @@ import {
     instanceLabel,
     loadInstances,
     outputStyle,
+    resolveParams,
 } from './indicator-defs';
 import type { IndicatorPoint } from './indicators';
 import type { ChartColors } from './theme-store';
@@ -53,10 +54,7 @@ export function renderIndicatorSeries(
         if (!def) continue;
         if (inst.hidden) continue;
         if (inst.visibleTf && !inst.visibleTf.includes(tfMinutes)) continue;
-        const params: Record<string, number> = {};
-        for (const p of def.params) {
-            params[p.key] = inst.params[p.key] ?? p.def;
-        }
+        const params = resolveParams(inst, def, tfMinutes);
         let out: Record<string, IndicatorPoint[]>;
         try {
             out = def.compute(bars, params);
@@ -154,7 +152,7 @@ export function renderIndicatorSeries(
         }
         if (firstSeries) {
             legend.push({
-                label: instanceLabel(inst),
+                label: instanceLabel(inst, tfMinutes),
                 color: outputStyle(inst, def, def.outputs[0]!.key).color,
                 pane,
             });

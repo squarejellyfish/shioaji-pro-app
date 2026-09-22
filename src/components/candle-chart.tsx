@@ -46,6 +46,7 @@ import {
     loadInstances,
     newInstance,
     outputStyle,
+    resolveParams,
     saveFavorites,
     saveInstances,
     type IndicatorInstance,
@@ -1181,10 +1182,7 @@ export function CandleChart({
             if (inst.visibleTf && !inst.visibleTf.includes(tf.minutes)) {
                 continue;
             }
-            const params: Record<string, number> = {};
-            for (const p of def.params) {
-                params[p.key] = inst.params[p.key] ?? p.def;
-            }
+            const params = resolveParams(inst, def, tf.minutes);
             let out: Record<string, IndicatorPoint[]>;
             try {
                 out = def.compute(bars, params);
@@ -1559,7 +1557,7 @@ export function CandleChart({
                                         title='開啟指標設定'
                                         onClick={() => openSettings(inst.id)}
                                     >
-                                        {instanceLabel(inst)}
+                                        {instanceLabel(inst, tf.minutes)}
                                     </button>
                                     {offTf && (
                                         <span className={styles.legendNote}>
@@ -1853,6 +1851,7 @@ export function CandleChart({
                             label: t.label,
                             minutes: t.minutes,
                         }))}
+                        tfMinutes={tf.minutes}
                         onPatch={(patch) =>
                             patchInstance(settingsInst.id, patch)
                         }

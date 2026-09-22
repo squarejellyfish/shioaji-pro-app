@@ -621,6 +621,29 @@ export const savedTip = style({
     color: vars.color.accent,
 });
 
+export const tfParamNote = style({
+    display: 'flex',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: '8px',
+    fontFamily: vars.font.body,
+    fontSize: '0.68rem',
+    color: vars.color.mutedForeground,
+    padding: '2px 0 6px',
+});
+
+export const tfParamRevert = style({
+    fontFamily: vars.font.body,
+    fontSize: '0.68rem',
+    color: vars.color.accent,
+    background: 'transparent',
+    border: 'none',
+    cursor: 'pointer',
+    padding: 0,
+    textDecoration: 'underline',
+    ':hover': { opacity: 0.8 },
+});
+
 const widthBtnBase = style({
     display: 'inline-flex',
     alignItems: 'center',
