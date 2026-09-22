@@ -135,6 +135,44 @@ describe('trendDeviationChannel', () => {
         expect(asymSpreadUp).not.toBeCloseTo(asymSpreadDown, 3);
     });
 
+    it('draws a single straight line — gapped before the window, constant per-bar slope, and projected 5 bars into the future', () => {
+        // Pine draws this channel once, at the latest bar's regression fit,
+        // as a straight line segment (not a fresh per-bar recomputation) —
+        // see the trendDeviationChannel doc comment in indicators.ts.
+        const closes = noisy((i) => 100 + i * 0.8, 120, 0.3);
+        const r = run(closes);
+        const windowStart = closes.length - 1 - DEFAULTS.trendLen;
+
+        // gapped everywhere before the drawn window
+        for (let i = 0; i < windowStart; i++) {
+            expect(r.trendUp[i]!.value).toBeUndefined();
+            expect(r.upper1[i]!.value).toBeUndefined();
+        }
+
+        // constant per-bar delta across the drawn span (a straight line)
+        const centerAt = (i: number) =>
+            r.trendUp[i]?.value ?? r.trendDown[i]?.value ?? r.trendNeutral[i]?.value;
+        const deltas: number[] = [];
+        for (let i = windowStart + 1; i < closes.length; i++) {
+            deltas.push(centerAt(i)! - centerAt(i - 1)!);
+        }
+        for (const d of deltas) expect(d).toBeCloseTo(deltas[0]!, 9);
+
+        // 5 extra bars projected past the last real bar, on the same line
+        // and at a consistent time step
+        expect(r.trendUp.length).toBe(closes.length + 5);
+        const interval = closes.length >= 2 ? 60 : 60; // makeBars uses a fixed 60s step
+        const lastRealTime = r.trendUp[closes.length - 1]!.time;
+        for (let k = 1; k <= 5; k++) {
+            const p = r.trendUp[closes.length - 1 + k]!;
+            expect(p.time).toBe(lastRealTime + k * interval);
+            expect(p.value).toBeDefined();
+        }
+        const projectedDelta =
+            r.trendUp[closes.length]!.value! - r.trendUp[closes.length - 1]!.value!;
+        expect(projectedDelta).toBeCloseTo(deltas[0]!, 9);
+    });
+
     it('is registered in the indicator picker with the trendDeviationChannel compute path', async () => {
         const { DEF_BY_TYPE } = await import('./indicator-defs');
         const def = DEF_BY_TYPE.get('trenddevchannel');

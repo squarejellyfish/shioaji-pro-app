@@ -577,28 +577,37 @@ export function bias(bars: Candle[], period = 20): IndicatorPoint[] {
 }
 
 // ---- Trend Deviation Channel ----
-// Least-squares regression trend line fit over the prior `trendLen` closes
-// (evaluated one bar back, then projected one step forward to the current
-// bar), with ATR-normalized deviation rails around it and a 3-state
-// (up/down/neutral) classifier driven by regression-slope strength vs. an
-// efficiency-adjusted threshold. Ported from the Pine Script "Trend
-// Deviation Channel (Zeiierman)"; the floating rail labels, live badge,
-// deviation-profile histogram, crossing markers and alerts have no
-// equivalent in this app's line-series renderer, so only the channel math
-// (trend line + 6 deviation rails) carries over — every output is a full
-// historical series rather than a last-bar-only projection, matching how
-// donchian/keltner/supertrend already render here.
+// Ported from the Pine Script "Trend Deviation Channel (Zeiierman)". The
+// source draws the channel as a single straight `line.new()` segment,
+// redrawn only at `barstate.islast` using that bar's regression fit —
+// it is NOT a per-bar-recomputed rolling band. Concretely, the Pine
+// "Drawing" block fits a `tl`-bar regression at the current bar only,
+// then draws a straight line from x1=bar_index-tl to x2=bar_index+5
+// using that one fit, with the deviation rails as constant vertical
+// offsets from it (so the whole channel is a set of parallel straight
+// lines, not a wiggly band). Plotting each historical bar's own
+// from-scratch regression as a continuous series (as an earlier version
+// of this port did) makes the center line hug every local swing like a
+// short moving average instead of the smooth straight trend projection
+// the indicator is meant to show.
+//
+// This port keeps the full per-bar walk for the trend-state machine
+// (tr/ts/req below need to see the whole history to evolve correctly —
+// same as Pine, which updates its `var tr` on every confirmed bar) but
+// only computes the deviation width (the O(trendLen) clipped, sign-split
+// residual sum — non-linear, so it can't be reduced to a rolling sum)
+// once, at the last bar, and draws the line/rails as a straight
+// projection spanning `[lastBar-trendLen, lastBar+5]` from that single
+// fit, gapped everywhere else — matching Pine exactly and dropping the
+// per-bar residual cost from O(n·trendLen) to O(n+trendLen).
 //
 // The regression window's relative x-coordinates (0..tl-1) are the same
 // for every bar, so sumX/sumX2 are constants and sumY/sumXY reduce to a
 // difference of two prefix sums — an O(1)-per-bar sliding regression
 // instead of re-summing all `tl` closes on every bar. The "path" (total
-// absolute movement) term behind the efficiency ratio is likewise a plain
-// windowed sum of a per-bar-independent series, so it gets the same
-// prefix-sum treatment. The clipped, sign-split residual sum below it
-// can't be reduced the same way — each bar's residuals are measured
-// against that bar's own fit line, and clipping is non-linear — so it
-// stays O(tl) per bar, same as the source Pine script's own `for` loop.
+// absolute movement) term behind the efficiency ratio is likewise a
+// plain windowed sum of a per-bar-independent series, so it gets the
+// same prefix-sum treatment.
 export interface TrendDeviationChannelResult {
     trendUp: IndicatorPoint[];
     trendDown: IndicatorPoint[];
@@ -651,70 +660,24 @@ export function trendDeviationChannel(
     const d3 = Math.max(d2 + 0.1, dev3In);
     const minN = Math.max(1, Math.floor(minSideSamples));
 
-    const trendUp: IndicatorPoint[] = [];
-    const trendDown: IndicatorPoint[] = [];
-    const trendNeutral: IndicatorPoint[] = [];
-    const upper1: IndicatorPoint[] = [];
-    const upper2: IndicatorPoint[] = [];
-    const upper3: IndicatorPoint[] = [];
-    const lower1: IndicatorPoint[] = [];
-    const lower2: IndicatorPoint[] = [];
-    const lower3: IndicatorPoint[] = [];
-    const gap = (arr: IndicatorPoint[], time: number) => arr.push({ time });
-    const val = (arr: IndicatorPoint[], time: number, v: number) =>
-        arr.push({ time, value: v });
-
+    // pass 1: walk every bar to evolve the trend-state machine and keep
+    // the most recent valid regression fit (re/sg/at) — this alone is
+    // O(1) per bar via the prefix sums above
     let tr = 0; // -1 down, 0 neutral, 1 up
-    for (let i = 0; i < bars.length; i++) {
-        const time = bars[i]!.time;
-        const at = i >= 1 ? atArr[i - 1] : undefined;
-        if (i < tl || at === undefined || at <= 0) {
-            gap(trendUp, time);
-            gap(trendDown, time);
-            gap(trendNeutral, time);
-            gap(upper1, time);
-            gap(upper2, time);
-            gap(upper3, time);
-            gap(lower1, time);
-            gap(lower2, time);
-            gap(lower3, time);
-            continue;
-        }
-        // window is close[i-tl .. i-1]; relative x = j - windowStart
+    let finalIdx = -1;
+    let finalRe = 0;
+    let finalSg = 0;
+    let finalAt = 0;
+    for (let i = tl; i < n; i++) {
+        const at = atArr[i - 1];
+        if (at === undefined || at <= 0) continue;
+
         const windowStart = i - tl;
         const sumY = p0[i]! - p0[windowStart]!;
         const sumXY = p1[i]! - p1[windowStart]! - windowStart * sumY;
         const sg = (tl * sumXY - sumX * sumY) / denom;
         const intercept = (sumY - sg * sumX) / tl;
         const re = intercept + sg * (tl - 1);
-        const cap = at * shockCapAtr;
-
-        let upSS = 0;
-        let downSS = 0;
-        let allSS = 0;
-        let upN = 0;
-        let downN = 0;
-        for (let lag = 1; lag <= tl; lag++) {
-            const fitAt = re - sg * (lag - 1);
-            const q = Math.max(-cap, Math.min(cap, close[i - lag]! - fitAt));
-            allSS += q * q;
-            if (q >= 0) {
-                upSS += q * q;
-                upN++;
-            } else {
-                downSS += q * q;
-                downN++;
-            }
-        }
-        const avgDev = Math.sqrt(allSS / tl);
-        const upDev = upN >= minN ? Math.sqrt(upSS / upN) : avgDev;
-        const downDev = downN >= minN ? Math.sqrt(downSS / downN) : avgDev;
-
-        const floor = at * minWidthAtr;
-        const shared = Math.max(avgDev, floor);
-        const us = symmetric ? shared : Math.max(upDev, floor);
-        const ds = symmetric ? shared : Math.max(downDev, floor);
-        const bs = re + sg;
 
         const path = cumDiff[i]! - cumDiff[windowStart + 1]!;
         const disp = Math.abs(close[i - 1]! - close[windowStart]!);
@@ -734,18 +697,94 @@ export function trendDeviationChannel(
             else if (ts > -exitStrength) tr = 0;
         }
 
-        if (tr === 1) val(trendUp, time, bs);
-        else gap(trendUp, time);
-        if (tr === -1) val(trendDown, time, bs);
-        else gap(trendDown, time);
-        if (tr === 0) val(trendNeutral, time, bs);
-        else gap(trendNeutral, time);
-        val(upper1, time, bs + d1 * us);
-        val(upper2, time, bs + d2 * us);
-        val(upper3, time, bs + d3 * us);
-        val(lower1, time, bs - d1 * ds);
-        val(lower2, time, bs - d2 * ds);
-        val(lower3, time, bs - d3 * ds);
+        finalIdx = i;
+        finalRe = re;
+        finalSg = sg;
+        finalAt = at;
+    }
+
+    const trendUp: IndicatorPoint[] = [];
+    const trendDown: IndicatorPoint[] = [];
+    const trendNeutral: IndicatorPoint[] = [];
+    const upper1: IndicatorPoint[] = [];
+    const upper2: IndicatorPoint[] = [];
+    const upper3: IndicatorPoint[] = [];
+    const lower1: IndicatorPoint[] = [];
+    const lower2: IndicatorPoint[] = [];
+    const lower3: IndicatorPoint[] = [];
+    const gap = (time: number) => {
+        trendUp.push({ time });
+        trendDown.push({ time });
+        trendNeutral.push({ time });
+        upper1.push({ time });
+        upper2.push({ time });
+        upper3.push({ time });
+        lower1.push({ time });
+        lower2.push({ time });
+        lower3.push({ time });
+    };
+
+    if (finalIdx < 0) {
+        for (const b of bars) gap(b.time);
+        return { trendUp, trendDown, trendNeutral, upper1, upper2, upper3, lower1, lower2, lower3 };
+    }
+
+    // pass 2: the deviation width only matters for the single straight
+    // channel we're about to draw, so compute it once, at finalIdx —
+    // this is the O(tl) clipped/sign-split residual sum that can't be
+    // turned into a rolling sum (see the doc comment above)
+    const cap = finalAt * shockCapAtr;
+    let upSS = 0;
+    let downSS = 0;
+    let allSS = 0;
+    let upN = 0;
+    let downN = 0;
+    for (let lag = 1; lag <= tl; lag++) {
+        const fitAt = finalRe - finalSg * (lag - 1);
+        const q = Math.max(-cap, Math.min(cap, close[finalIdx - lag]! - fitAt));
+        allSS += q * q;
+        if (q >= 0) {
+            upSS += q * q;
+            upN++;
+        } else {
+            downSS += q * q;
+            downN++;
+        }
+    }
+    const avgDev = Math.sqrt(allSS / tl);
+    const upDev = upN >= minN ? Math.sqrt(upSS / upN) : avgDev;
+    const downDev = downN >= minN ? Math.sqrt(downSS / downN) : avgDev;
+    const floor = finalAt * minWidthAtr;
+    const shared = Math.max(avgDev, floor);
+    const us = symmetric ? shared : Math.max(upDev, floor);
+    const ds = symmetric ? shared : Math.max(downDev, floor);
+
+    // straight-line channel: center(x) = finalRe + finalSg*(x-anchor),
+    // rails are constant offsets from it — spans [finalIdx-tl, finalIdx]
+    // plus 5 bars projected into the future, matching Pine's x1/x2/c1/c2
+    const anchor = finalIdx - 1;
+    const windowStart = finalIdx - tl;
+    const centerAt = (x: number) => finalRe + finalSg * (x - anchor);
+    const draw = (time: number, x: number) => {
+        const c = centerAt(x);
+        trendUp.push(tr === 1 ? { time, value: c } : { time });
+        trendDown.push(tr === -1 ? { time, value: c } : { time });
+        trendNeutral.push(tr === 0 ? { time, value: c } : { time });
+        upper1.push({ time, value: c + d1 * us });
+        upper2.push({ time, value: c + d2 * us });
+        upper3.push({ time, value: c + d3 * us });
+        lower1.push({ time, value: c - d1 * ds });
+        lower2.push({ time, value: c - d2 * ds });
+        lower3.push({ time, value: c - d3 * ds });
+    };
+
+    for (let i = 0; i < windowStart; i++) gap(bars[i]!.time);
+    for (let i = windowStart; i <= finalIdx; i++) draw(bars[i]!.time, i);
+    for (let i = finalIdx + 1; i < n; i++) gap(bars[i]!.time);
+
+    const interval = n >= 2 ? bars[n - 1]!.time - bars[n - 2]!.time : 60;
+    for (let k = 1; k <= 5; k++) {
+        draw(bars[finalIdx]!.time + k * interval, finalIdx + k);
     }
 
     return {
