@@ -575,3 +575,188 @@ export function bias(bars: Candle[], period = 20): IndicatorPoint[] {
     }
     return out;
 }
+
+// ---- Trend Deviation Channel ----
+// Least-squares regression trend line fit over the prior `trendLen` closes
+// (evaluated one bar back, then projected one step forward to the current
+// bar), with ATR-normalized deviation rails around it and a 3-state
+// (up/down/neutral) classifier driven by regression-slope strength vs. an
+// efficiency-adjusted threshold. Ported from the Pine Script "Trend
+// Deviation Channel (Zeiierman)"; the floating rail labels, live badge,
+// deviation-profile histogram, crossing markers and alerts have no
+// equivalent in this app's line-series renderer, so only the channel math
+// (trend line + 6 deviation rails) carries over — every output is a full
+// historical series rather than a last-bar-only projection, matching how
+// donchian/keltner/supertrend already render here.
+//
+// The regression window's relative x-coordinates (0..tl-1) are the same
+// for every bar, so sumX/sumX2 are constants and sumY/sumXY reduce to a
+// difference of two prefix sums — an O(1)-per-bar sliding regression
+// instead of re-summing all `tl` closes on every bar. The "path" (total
+// absolute movement) term behind the efficiency ratio is likewise a plain
+// windowed sum of a per-bar-independent series, so it gets the same
+// prefix-sum treatment. The clipped, sign-split residual sum below it
+// can't be reduced the same way — each bar's residuals are measured
+// against that bar's own fit line, and clipping is non-linear — so it
+// stays O(tl) per bar, same as the source Pine script's own `for` loop.
+export interface TrendDeviationChannelResult {
+    trendUp: IndicatorPoint[];
+    trendDown: IndicatorPoint[];
+    trendNeutral: IndicatorPoint[];
+    upper1: IndicatorPoint[];
+    upper2: IndicatorPoint[];
+    upper3: IndicatorPoint[];
+    lower1: IndicatorPoint[];
+    lower2: IndicatorPoint[];
+    lower3: IndicatorPoint[];
+}
+
+export function trendDeviationChannel(
+    bars: Candle[],
+    trendLen: number,
+    enterStrength: number,
+    exitStrength: number,
+    symmetric: boolean,
+    shockCapAtr: number,
+    minWidthAtr: number,
+    minSideSamples: number,
+    dev1In: number,
+    dev2In: number,
+    dev3In: number,
+): TrendDeviationChannelResult {
+    const n = bars.length;
+    const tl = Math.max(2, Math.floor(trendLen));
+    const close = bars.map((b) => b.close);
+    const atArr = rma(trueRanges(bars), 100);
+
+    // prefix sums of close[j] and j*close[j] → O(1) windowed sumY/sumXY
+    const p0: number[] = new Array(n + 1).fill(0);
+    const p1: number[] = new Array(n + 1).fill(0);
+    for (let j = 0; j < n; j++) {
+        p0[j + 1] = p0[j]! + close[j]!;
+        p1[j + 1] = p1[j]! + j * close[j]!;
+    }
+    const sumX = (tl * (tl - 1)) / 2;
+    const sumX2 = ((tl - 1) * tl * (2 * tl - 1)) / 6;
+    const denom = tl * sumX2 - sumX * sumX;
+
+    // prefix sum of |close[j]-close[j-1]| → O(1) windowed "path" lookup
+    const cumDiff: number[] = new Array(n + 1).fill(0);
+    for (let j = 1; j < n; j++) {
+        cumDiff[j + 1] = cumDiff[j]! + Math.abs(close[j]! - close[j - 1]!);
+    }
+
+    const d1 = Math.max(0.25, dev1In);
+    const d2 = Math.max(d1 + 0.1, dev2In);
+    const d3 = Math.max(d2 + 0.1, dev3In);
+    const minN = Math.max(1, Math.floor(minSideSamples));
+
+    const trendUp: IndicatorPoint[] = [];
+    const trendDown: IndicatorPoint[] = [];
+    const trendNeutral: IndicatorPoint[] = [];
+    const upper1: IndicatorPoint[] = [];
+    const upper2: IndicatorPoint[] = [];
+    const upper3: IndicatorPoint[] = [];
+    const lower1: IndicatorPoint[] = [];
+    const lower2: IndicatorPoint[] = [];
+    const lower3: IndicatorPoint[] = [];
+    const gap = (arr: IndicatorPoint[], time: number) => arr.push({ time });
+    const val = (arr: IndicatorPoint[], time: number, v: number) =>
+        arr.push({ time, value: v });
+
+    let tr = 0; // -1 down, 0 neutral, 1 up
+    for (let i = 0; i < bars.length; i++) {
+        const time = bars[i]!.time;
+        const at = i >= 1 ? atArr[i - 1] : undefined;
+        if (i < tl || at === undefined || at <= 0) {
+            gap(trendUp, time);
+            gap(trendDown, time);
+            gap(trendNeutral, time);
+            gap(upper1, time);
+            gap(upper2, time);
+            gap(upper3, time);
+            gap(lower1, time);
+            gap(lower2, time);
+            gap(lower3, time);
+            continue;
+        }
+        // window is close[i-tl .. i-1]; relative x = j - windowStart
+        const windowStart = i - tl;
+        const sumY = p0[i]! - p0[windowStart]!;
+        const sumXY = p1[i]! - p1[windowStart]! - windowStart * sumY;
+        const sg = (tl * sumXY - sumX * sumY) / denom;
+        const intercept = (sumY - sg * sumX) / tl;
+        const re = intercept + sg * (tl - 1);
+        const cap = at * shockCapAtr;
+
+        let upSS = 0;
+        let downSS = 0;
+        let allSS = 0;
+        let upN = 0;
+        let downN = 0;
+        for (let lag = 1; lag <= tl; lag++) {
+            const fitAt = re - sg * (lag - 1);
+            const q = Math.max(-cap, Math.min(cap, close[i - lag]! - fitAt));
+            allSS += q * q;
+            if (q >= 0) {
+                upSS += q * q;
+                upN++;
+            } else {
+                downSS += q * q;
+                downN++;
+            }
+        }
+        const avgDev = Math.sqrt(allSS / tl);
+        const upDev = upN >= minN ? Math.sqrt(upSS / upN) : avgDev;
+        const downDev = downN >= minN ? Math.sqrt(downSS / downN) : avgDev;
+
+        const floor = at * minWidthAtr;
+        const shared = Math.max(avgDev, floor);
+        const us = symmetric ? shared : Math.max(upDev, floor);
+        const ds = symmetric ? shared : Math.max(downDev, floor);
+        const bs = re + sg;
+
+        const path = cumDiff[i]! - cumDiff[windowStart + 1]!;
+        const disp = Math.abs(close[i - 1]! - close[windowStart]!);
+        const ef = path > 0 ? disp / path : 0;
+        const ts = (sg * (tl - 1)) / at;
+        const effQ = Math.max(0, Math.min(1, ef / 0.18));
+        const req = enterStrength * (1.5 - 0.5 * effQ);
+
+        if (tr === 0) {
+            if (ts > req) tr = 1;
+            else if (ts < -req) tr = -1;
+        } else if (tr === 1) {
+            if (ts < -req) tr = -1;
+            else if (ts < exitStrength) tr = 0;
+        } else {
+            if (ts > req) tr = 1;
+            else if (ts > -exitStrength) tr = 0;
+        }
+
+        if (tr === 1) val(trendUp, time, bs);
+        else gap(trendUp, time);
+        if (tr === -1) val(trendDown, time, bs);
+        else gap(trendDown, time);
+        if (tr === 0) val(trendNeutral, time, bs);
+        else gap(trendNeutral, time);
+        val(upper1, time, bs + d1 * us);
+        val(upper2, time, bs + d2 * us);
+        val(upper3, time, bs + d3 * us);
+        val(lower1, time, bs - d1 * ds);
+        val(lower2, time, bs - d2 * ds);
+        val(lower3, time, bs - d3 * ds);
+    }
+
+    return {
+        trendUp,
+        trendDown,
+        trendNeutral,
+        upper1,
+        upper2,
+        upper3,
+        lower1,
+        lower2,
+        lower3,
+    };
+}
