@@ -459,7 +459,7 @@ export function IndicatorSettingsModal({
     timeframes: { label: string; minutes: number }[];
     onPatch: (patch: Partial<IndicatorInstance>) => void;
     onRemove: () => void;
-    onCommit: () => void;
+    onCommit: (patch?: Partial<IndicatorInstance>) => void;
     onCancel: () => void;
 }) {
     const def = DEF_BY_TYPE.get(inst.type);
@@ -471,6 +471,29 @@ export function IndicatorSettingsModal({
     const [plotFor, setPlotFor] = useState<string | null>(null);
     const [defaultsOpen, setDefaultsOpen] = useState(false);
     const [savedTip, setSavedTip] = useState(false);
+
+    // 參數輸入框：只在本地暫存文字，不即時 onPatch — 避免每個 keystroke
+    // 都把超出範圍的中間值夾回 min/max，導致打不出 min/max 以外的數字
+    // （例如 min=20 時打「1」會立刻被夾成「20」）。只在按下「確定」時
+    // 才把暫存值 clamp 後一次套用並送出。
+    const buildParamDraft = (params: Record<string, number>) =>
+        Object.fromEntries(
+            (def?.params ?? []).map((p) => [p.key, String(params[p.key] ?? p.def)]),
+        );
+    const [paramDraft, setParamDraft] = useState<Record<string, string>>(() =>
+        buildParamDraft(inst.params),
+    );
+    const resolvedParams = (): Record<string, number> => {
+        const out: Record<string, number> = { ...inst.params };
+        for (const p of def?.params ?? []) {
+            const raw = paramDraft[p.key];
+            const v = raw === undefined ? NaN : Number(raw);
+            out[p.key] = Number.isFinite(v)
+                ? Math.min(p.max, Math.max(p.min, v))
+                : (inst.params[p.key] ?? p.def);
+        }
+        return out;
+    };
 
     useEscClose(onCancel);
 
@@ -556,19 +579,12 @@ export function IndicatorSettingsModal({
                                     min={p.min}
                                     max={p.max}
                                     step={p.step ?? 1}
-                                    value={inst.params[p.key] ?? p.def}
+                                    value={paramDraft[p.key] ?? String(inst.params[p.key] ?? p.def)}
                                     onChange={(e) => {
-                                        const v = Number(e.target.value);
-                                        if (!Number.isFinite(v)) return;
-                                        onPatch({
-                                            params: {
-                                                ...inst.params,
-                                                [p.key]: Math.min(
-                                                    p.max,
-                                                    Math.max(p.min, v),
-                                                ),
-                                            },
-                                        });
+                                        setParamDraft((d) => ({
+                                            ...d,
+                                            [p.key]: e.target.value,
+                                        }));
                                     }}
                                 />
                             </label>
@@ -809,6 +825,7 @@ export function IndicatorSettingsModal({
                                             showLabels: undefined,
                                             showValues: undefined,
                                         });
+                                        setParamDraft(buildParamDraft(f.params));
                                         setDefaultsOpen(false);
                                     }}
                                 >
@@ -849,7 +866,10 @@ export function IndicatorSettingsModal({
                         >
                             取消
                         </button>
-                        <button className={styles.okBtn} onClick={onCommit}>
+                        <button
+                            className={styles.okBtn}
+                            onClick={() => onCommit({ params: resolvedParams() })}
+                        >
                             確定
                         </button>
                     </div>

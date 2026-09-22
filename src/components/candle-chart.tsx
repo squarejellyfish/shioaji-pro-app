@@ -1444,10 +1444,11 @@ export function CandleChart({
         setSettingsDraft(null);
         setSettingsFor(null);
     };
-    const commitSettings = () => {
+    const commitSettings = (patch?: Partial<IndicatorInstance>) => {
         if (!settingsDraft) return;
-        const list = settingsNewRef.current ? [...savedInstances, settingsDraft]
-            : savedInstances.map(i => i.id === settingsDraft.id ? settingsDraft : i);
+        const finalDraft = patch ? { ...settingsDraft, ...patch } : settingsDraft;
+        const list = settingsNewRef.current ? [...savedInstances, finalDraft]
+            : savedInstances.map(i => i.id === finalDraft.id ? finalDraft : i);
         try {
             if (panelService && panelId) panelService.replace(panelId, list, settingsRevisionRef.current);
             else commitInstances(list);
