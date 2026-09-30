@@ -35,7 +35,12 @@ import {
     X,
 } from 'lucide-react';
 import { useContext, useEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
-import { useChartDrawings } from '../hooks/use-chart-drawings';
+import {
+    orderLineMayTakePointer,
+    useChartDrawings,
+    type ChartDrawingsApi,
+} from '../hooks/use-chart-drawings';
+import { takeDrawingSaveErrorNotice, useDrawingsSaveFailed } from '../lib/chart-drawings';
 import { useQuote } from '../hooks/use-stream';
 import {
     colorWithOpacity,
@@ -82,7 +87,7 @@ import { futuresRootCode } from '../lib/chart-drawings';
 import { closePositionAtMarket } from '../lib/position-exit';
 import { cancelOrder, updateOrderPrice } from '../lib/shioaji';
 import { canUpdateOrderPrice } from '../lib/odd-lot';
-import { getChartColors, useThemeSettings, themeKey as themeKeyOf } from '../lib/theme-store';
+import { baseMode, getChartColors, useThemeSettings, themeKey as themeKeyOf } from '../lib/theme-store';
 import { notify, placeQuickOrder } from '../lib/trade';
 import {
     chartModeHint,
@@ -743,6 +748,11 @@ export function CandleChart({
         })();
     };
 
+    // 畫圖工具武裝中（下方 useChartDrawings 每次 render 更新）。標籤的
+    // 互動 effect 宣告在畫圖 hook 之前，靠這個 ref 讀最新狀態
+    const drawingArmedRef = useRef(false);
+    const drawingsRef = useRef<ChartDrawingsApi | null>(null);
+
     // 標籤互動：握把（或線身）上下拖曳改價、✕ 撤單
     useEffect(() => {
         const host = hostRef.current;
@@ -763,6 +773,15 @@ export function CandleChart({
             });
 
         const hitAt = (e: MouseEvent) => {
+            // 標籤都貼在價格軸旁（等同把手區），但武裝畫圖工具、或游標下是
+            // 選取中的畫圖物件時，這一下歸畫圖（見 orderLineMayTakePointer）
+            const d = drawingsRef.current;
+            if (!orderLineMayTakePointer({
+                drawingArmed: drawingArmedRef.current,
+                defaultPrevented: e.defaultPrevented,
+                drawingHit: d?.drawingAt(e) ?? null,
+                inGrip: true,
+            })) return null;
             const layer = badgeLayerRef.current;
             const pt = layer?.pointOf(e);
             if (!layer || !pt) return null;
@@ -963,7 +982,22 @@ export function CandleChart({
         getTimes: () => barTimesRef.current,
         tradeArmed: mode !== 'observe',
         onEnterDrawingMode: () => setMode('observe'),
+        themeMode: baseMode(themeSettings),
     });
+    drawingArmedRef.current = drawings.tool !== null;
+    drawingsRef.current = drawings;
+
+    // 畫圖存不進 localStorage（配額滿）— 畫面上的物件還在，但關掉就沒了。
+    // 多張圖同時訂閱，notice 只由第一張拿到的圖發出
+    const drawingsSaveFailed = useDrawingsSaveFailed();
+    useEffect(() => {
+        if (!drawingsSaveFailed || !takeDrawingSaveErrorNotice()) return;
+        notify({
+            kind: 'err',
+            title: '畫圖未能儲存',
+            body: '瀏覽器儲存空間已滿，新的畫圖只保留到關閉視窗為止。請刪除部分畫圖後再試。',
+        });
+    }, [drawingsSaveFailed]);
 
     // keep latest theme readable inside the chart-creation effect
     const themeSettingsRef = useRef(themeSettings);
