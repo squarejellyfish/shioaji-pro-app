@@ -13,23 +13,79 @@ import {
     setApiScheme,
 } from './runtime';
 import {
-    fetchAccounts,
     fetchHealth,
     fetchInfo,
+    fetchTradeCacheHealth,
     subscribeTradeEvents,
 } from './shioaji';
-import { onOrderEvent } from './stream';
+import { ensureStream, getStreamStatus, holdStream, onOrderEvent, releaseStream, subscribeStatusStore } from './stream';
 import {
     harnessOwnershipCompatible,
+    caActive,
+    consumeTrayReadyOnReload,
     loadDesktopSettings,
     localTlsCertExists,
+    markTrayReadyOnReload,
     nativeOwnsHarnessSidecar,
+    reloadWhenHealthy,
     serverStart,
     serverStatus,
+    type DesktopSettings,
+    type ServerStatus,
+    setTrayStatus,
 } from './tauri';
+import {
+    beginBootTiming,
+    endTiming,
+    getActiveTiming,
+    markStage,
+    peekActiveTiming,
+    reloadedIntoHealthyServer,
+    type TimingOutcome,
+} from './startup-timing';
+import { appReadySignals, startStallProbe, watchFrontendReady } from './frontend-ready';
+import { ensureAccounts, loadAccountsShared } from './account-store';
+import { timedAutostart } from './server-actions';
+import { startTradingState } from './trading-state';
+import { serverHealthReady } from './server-health';
+import { FAST_START_SCHEDULE, pollDelay } from './poll-until';
+import { setServerIdentityVerified } from './server-identity';
 import { logNotice, notify } from './trade';
+import { isChildWindow } from './window-role';
 
 let booted = false;
+let tradingStarted = false;
+
+function startTradingStateOnce() {
+    if (tradingStarted) return;
+    tradingStarted = true;
+    markStage('trading-start');
+    startTradingState();
+}
+
+async function matchesServerIdentity(status: ServerStatus | null, settings: DesktopSettings): Promise<boolean> {
+    if (!status?.running) return false;
+    // An HTTPS listener proves its cert exists. Only an HTTP listener needs
+    // the file check before deciding the setting is incompatible.
+    const scheme = status.scheme ?? 'http';
+    const schemeOk = settings.httpsEnabled
+        ? scheme === 'https' || !(await localTlsCertExists().catch(() => false))
+        : scheme === 'http';
+    const harnessOwned = harnessOwnershipCompatible(
+        settings.agentHarnessEnabled,
+        !!status.port && await nativeOwnsHarnessSidecar(status.port),
+    );
+    if (status.simulation !== !settings.production || !schemeOk || !harnessOwned ||
+        (EXPECTED_SERVER_VERSION !== '' && status.version !== undefined && status.version !== EXPECTED_SERVER_VERSION)) {
+        return false;
+    }
+    return true;
+}
+
+async function serverCaReady(status: ServerStatus, settings: DesktopSettings): Promise<boolean> {
+    return !settings.production || !settings.caPath ||
+        (!!status.port && await caActive(status.port, status.scheme));
+}
 
 // Windows/WebView2 keyboard-focus self-heal. The native window can be
 // ACTIVE while the webview holds no keyboard focus — mouse keeps working
@@ -67,11 +123,27 @@ function installKeyboardFocusHeal() {
 export function bootstrap() {
     if (booted) return;
     booted = true;
+    if (isTauri && !isChildWindow()) setServerIdentityVerified(false);
     installKeyboardFocusHeal();
     // agent scheduled/triggered tasks run for the app's lifetime
     agentModule?.ensureScheduler();
+    if (isTauri && !isChildWindow()) {
+        const syncTray = () => {
+            const state = getStreamStatus();
+            setTrayStatus(state === 'live' ? 'idle' : state === 'connecting' ? 'conn' : 'error');
+        };
+        subscribeStatusStore(syncTray);
+        const motion = window.matchMedia('(prefers-reduced-motion: reduce)');
+        motion.addEventListener('change', syncTray);
+        const initialTrayStatus = consumeTrayReadyOnReload() ? 'ready' : 'cold';
+        syncTray();
+        setTrayStatus(initialTrayStatus);
+    }
     // every order event lands in the 通知中心 log (toasts stay separate)
     onOrderEvent((ev) => {
+        if (ev.kind === 'deal') setTrayStatus('filled');
+        else if (ev.failed) setTrayStatus('error');
+        else if (ev.opType === 'New') setTrayStatus('order');
         const d = describeOrderReport(ev);
         logNotice({
             kind: d.kind === 'err' ? 'err' : 'info',
@@ -79,7 +151,35 @@ export function bootstrap() {
             body: d.lines.map((l) => l.text).join(' ｜ '),
         });
     });
+    // Right after our own post-start reload the server is known healthy:
+    // open the quote/order stream now instead of after the dashboard's
+    // first render (the stream opened ~2 s after boot-checked natively,
+    // #142). ensureStream is idempotent; panels mounting later reuse it.
+    // measure the main thread from page load (the first render included)
+    if (isTauri && !isChildWindow() && (peekActiveTiming() || !pageWasReloaded())) {
+        startStallProbe();
+    }
+    if (shouldOpenStreamEarly()) {
+        ensureStream();
+        // and the trading snapshot: its first read starts as soon as the
+        // stream is live (subscribe-before-snapshot rule unchanged), no
+        // longer after the dashboard mounted
+        startTradingStateOnce();
+    }
+    // A real App launch: until boot knows whether this page will be
+    // replaced by the post-start reload, don't let the dashboard open a
+    // stream to a server that may not be up (released on every path that
+    // keeps this page; expires on its own after 30 s)
+    else if (isTauri && !isChildWindow() && !pageWasReloaded()) holdStream();
     void run();
+}
+
+// only the main window, only on a reload that a timing run marked as
+// "server healthy → reload" — never on a cold start, where an early
+// connection would only fail and back off against a server still starting
+function shouldOpenStreamEarly(): boolean {
+    if (!isTauri || isChildWindow()) return false;
+    return reloadedIntoHealthyServer(pageWasReloaded(), peekActiveTiming());
 }
 
 async function run() {
@@ -87,67 +187,82 @@ async function run() {
     // popouts and flash tiles each run their own bootstrap(), and concurrent
     // serverStarts race for the same port and clobber the pid record. They
     // still get the health watchdog below.
-    const isPopout = new URLSearchParams(window.location.search).has(
-        'popout',
-    );
+    // (they also have no settings-store permission: see window-role.ts)
+    const isPopout = isChildWindow();
+    // startup timing (issue #142) is owned by the main window: a run begun
+    // before a reload (start/restart/switch) continues here; an app launch
+    // retires the previous session's leftover and, with autostart, opens a
+    // cold-start run from the webview's navigation start.
+    const timed = isTauri && !isPopout;
+    let coldStart = false;
+    let bootTimed = false;
+    let expectedSettings: DesktopSettings | null = null;
+    let settingsLoaded = !isTauri || isPopout;
+    const openBootTiming = (autoStart: boolean) => {
+        if (!timed || bootTimed) return;
+        bootTimed = true;
+        coldStart =
+            beginBootTiming({
+                reloaded: pageWasReloaded(),
+                autoStart,
+                navigationStart: Math.round(performance.timeOrigin),
+            }) === 'cold-start';
+    };
     if (isTauri && !isPopout) {
         try {
             const settings = await loadDesktopSettings();
-            if (settings.autoStart && settings.apiKey && settings.secretKey) {
+            settingsLoaded = true;
+            expectedSettings = settings;
+            const autoStart =
+                settings.autoStart && !!settings.apiKey && !!settings.secretKey;
+            openBootTiming(autoStart);
+            if (autoStart) {
+                markStage('probe');
+                const statusProbeStarted = Date.now();
                 const status = await serverStatus();
-                // 本機 HTTPS：the desired listener scheme also has to match
-                // — an http daemon while HTTPS is enabled (or vice versa)
-                // needs a restart to swap the listener. Judge a RUNNING
-                // https listener by its scheme alone: it serving TLS proves
-                // the certificate exists, and probing the cert file here
-                // (plugin-fs right at boot) can transiently fail — which
-                // used to misread "cert missing → want http", kill the
-                // healthy https server, and loop forever.
-                const scheme = status?.scheme ?? 'http';
-                const schemeOk = settings.httpsEnabled
-                    ? scheme === 'https' ||
-                      !(await localTlsCertExists().catch(() => false))
-                    : scheme === 'http';
-                const harnessOwned = harnessOwnershipCompatible(
-                    settings.agentHarnessEnabled,
-                    !!status?.port &&
-                        (await nativeOwnsHarnessSidecar(status.port)),
-                );
+                markStage('probe', `status ${Date.now() - statusProbeStarted}ms`);
+                const matches = await matchesServerIdentity(status, settings);
+                markStage('probe', 'identity checked');
                 // identity match: right mode, right listener scheme, right
                 // version — health is judged separately so a server that is
                 // merely WARMING UP (login + contract load, /health not yet
                 // 200) is never killed. Restart-kill during warmup was a
                 // reload loop: each reload landed inside the next server's
                 // warmup window and killed it again.
-                const matches =
-                    status?.running &&
-                    status.simulation === !settings.production &&
-                    schemeOk &&
-                    harnessOwned &&
-                    // version handshake — 不接版本不符的 server（例如
-                    // 使用者 8080 上的舊 CLI），改起自帶 sidecar
-                    (EXPECTED_SERVER_VERSION === '' ||
-                        status.version === undefined ||
-                        status.version === EXPECTED_SERVER_VERSION);
-                if (matches && status.healthy) {
-                    // daemon survived from a previous run (possibly on a
-                    // non-default port) — make sure the API base follows it
-                    const schemeChanged = status.scheme
-                        ? setApiScheme(status.scheme)
-                        : false;
-                    if (
-                        (status.port && setApiPort(status.port)) ||
-                        schemeChanged
-                    ) {
-                        window.location.reload();
+                if (matches && status?.healthy) {
+                    if (!(await serverCaReady(status, settings))) {
+                        notify({ kind: 'err', title: 'CA 尚未啟用',
+                            body: '正式環境 CA 未通過，交易已暫停。請檢查憑證並在伺服器面板手動重啟以套用設定。' });
+                    } else {
+                        // daemon survived from a previous run (possibly on a
+                        // non-default port) — make sure the API base follows it
+                        const schemeChanged = status.scheme
+                            ? setApiScheme(status.scheme)
+                            : false;
+                        if (
+                            (status.port && setApiPort(status.port)) ||
+                            schemeChanged
+                        ) {
+                            markStage('reload', 'port/scheme moved');
+                            window.location.reload();
+                            return;
+                        }
+                        settleBootRun(coldStart ? 'attached' : 'ok');
+                        setServerIdentityVerified(true);
+                        releaseStream('server confirmed');
+                        startTradingStateOnce();
                         return;
                     }
-                } else if (matches) {
+                } else if (matches && status) {
                     // the right server is starting up — adopt its address
-                    // and fall through to the bootstrap watchdog below,
-                    // which reloads once /health answers
+                    // and reload once /health answers, on the same fast
+                    // health wait as a fresh start (was: the 4 s watchdog
+                    // below). Past its 90 s budget, fall through to that
+                    // watchdog, which keeps waiting without a limit.
                     if (status.port) setApiPort(status.port);
                     if (status.scheme) setApiScheme(status.scheme);
+                    markStage('attach', 'server still starting');
+                    if (await reloadWhenHealthy()) return;
                 } else {
                     // not running, unhealthy, or wrong mode — serverStart
                     // stops a broken daemon and starts fresh
@@ -164,13 +279,20 @@ async function run() {
                             body: `模式：${settings.production ? '⚠ 正式環境' : '模擬環境'}`,
                         });
                     }
-                    const res = await serverStart(settings);
+                    // the probe above is milliseconds old: hand it over
+                    // instead of probing everything a second time
+                    const res = await timedAutostart(() =>
+                        serverStart({ ...settings, knownStatus: status }),
+                    );
                     if (!res.ok) {
                         notify({
                             kind: 'err',
                             title: '伺服器自動啟動失敗',
                             body: res.output.slice(0, 120),
                         });
+                        // The identity-aware watchdog below can recover if
+                        // a compatible server appears later. It must never
+                        // adopt a foreign or wrong-mode listener by health.
                     } else if (!res.attached || res.portChanged) {
                         // the daemon (re)started while panels were already
                         // firing their one-shot requests into the gap —
@@ -180,62 +302,95 @@ async function run() {
                             title: '⏳ 伺服器啟動中…',
                             body: '就緒後畫面將自動重新載入',
                         });
-                        const deadline = Date.now() + 90_000;
-                        let ticking = false; // overlapping ticks pile probes
-                        const timer = setInterval(async () => {
-                            if (ticking) return;
-                            if (Date.now() > deadline) {
-                                clearInterval(timer);
-                                return;
-                            }
-                            ticking = true;
-                            try {
-                                await fetchHealth();
-                                clearInterval(timer);
-                                window.location.reload();
-                            } catch {
-                                // not up yet
-                            } finally {
-                                ticking = false;
-                            }
-                        }, 2000);
+                        // sequential, immediate-first health poll (was a
+                        // 2 s interval whose first check waited 2 s)
+                        void reloadWhenHealthy().then((reloading) => {
+                            // health wait gave up: this page stays
+                            if (!reloading) releaseStream('health wait ended');
+                        });
+                        return;
+                    } else {
+                        // A concurrent healthy attach may carry a different
+                        // account snapshot than this page. Refresh once.
+                        markStage('healthy', 'attached server');
+                        markStage('reload', 'attached server');
+                        markTrayReadyOnReload();
+                        window.location.reload();
                         return;
                     }
+                }
+            } else {
+                // Autostart disabled: an existing desktop listener still
+                // needs the configured mode, scheme, CA and ownership before
+                // it can authorize mutations. If absent, keep watching.
+                const status = await serverStatus();
+                if (status?.healthy && await matchesServerIdentity(status, settings) &&
+                    await serverCaReady(status, settings)) {
+                    const portMoved = status.port ? setApiPort(status.port) : false;
+                    const schemeMoved = status.scheme ? setApiScheme(status.scheme) : false;
+                    const moved = portMoved || schemeMoved;
+                    if (moved) { window.location.reload(); return; }
+                    setServerIdentityVerified(true);
+                    settleBootRun('ok');
+                    releaseStream('server confirmed');
+                    startTradingStateOnce();
+                    return;
                 }
             }
         } catch {
             // sidecar unavailable — fall through to the health watchdog
         }
+        openBootTiming(false); // settings unreadable: still continue/retire
     }
+
+    // this page is kept (no reload is under way): let its stream connect
+    releaseStream('boot kept page');
 
     // bootstrap watchdog: reload once the server becomes reachable. Uses
     // the scheme-agnostic status probe (NOT fetchHealth, which is locked to
     // the persisted scheme) so it still finds the server after a 本機 HTTPS
     // toggle left localStorage pointing at the other listener type.
-    try {
-        await fetchHealth();
-        if (await serverVersionOk()) {
-            // The shared trading store subscribes before its initial snapshot.
-            return; // server was up at boot — components loaded normally
-        }
-        // wrong-version server answering on the persisted port — fall
-        // through to the watchdog: adopt it only after it's replaced
-    } catch {
-        notify({
-            kind: 'info',
-            title: '等待 shioaji server…',
-            body: '伺服器就緒後將自動載入畫面',
-        });
+    if (!settingsLoaded && isTauri && !isPopout) {
+        endTiming('failed', 'desktop settings unavailable');
+        return;
     }
-    let ticking = false; // async ticks must not overlap — probe pile-ups
-    // congest plugin-http until even live-server probes time out
-    const timer = setInterval(async () => {
-        if (ticking) return;
-        ticking = true;
+    if (!expectedSettings) {
         try {
-            const st = isTauri ? await serverStatus() : null;
+            const health = await fetchHealth();
+            if (serverHealthReady(health) && await serverVersionOk()) {
+                if (!isPopout) setServerIdentityVerified(true);
+                if (timed) settleBootRun('ok');
+                if (!isPopout) startTradingStateOnce();
+                // The shared trading store subscribes before its initial snapshot.
+                return; // server was up at boot — components loaded normally
+            }
+            // wrong-version server answering on the persisted port — fall
+            // through to the watchdog: adopt it only after it's replaced
+        } catch {
+            notify({
+                kind: 'info',
+                title: '等待 shioaji server…',
+                body: '伺服器就緒後將自動載入畫面',
+            });
+        }
+    }
+    // Keep the unlimited watchdog for servers that outlive the initial
+    // health wait, but check immediately and back off sequentially. A fixed
+    // 4 s interval made a healthy server sit idle for up to four seconds.
+    let attempt = 0;
+    let reloading = false;
+    const check = async () => {
+        try {
+            const st = isTauri
+                ? await serverStatus(expectedSettings
+                    ? async (candidate) => candidate.healthy === true &&
+                        await matchesServerIdentity(candidate, expectedSettings!) &&
+                        await serverCaReady(candidate, expectedSettings!)
+                    : undefined)
+                : null;
             if (st) {
                 if (!st.running || !st.healthy) return;
+                if (expectedSettings && !(await matchesServerIdentity(st, expectedSettings))) return;
                 if (
                     EXPECTED_SERVER_VERSION !== '' &&
                     st.version !== undefined &&
@@ -246,17 +401,52 @@ async function run() {
                 if (st.port) setApiPort(st.port);
                 if (st.scheme) setApiScheme(st.scheme);
             } else {
-                await fetchHealth();
+                if (!serverHealthReady(await fetchHealth())) return;
                 if (!(await serverVersionOk())) return; // warned; keep waiting
             }
-            clearInterval(timer);
+            reloading = true;
+            if (timed) {
+                markStage('healthy', 'boot watchdog');
+                markStage('reload');
+            }
+            markTrayReadyOnReload();
             window.location.reload();
         } catch {
             // keep waiting
         } finally {
-            ticking = false;
+            if (!reloading) window.setTimeout(check, pollDelay(++attempt, FAST_START_SCHEDULE));
         }
-    }, 4000);
+    };
+    void check();
+}
+
+// the server is healthy: the run ends once the front end is usable
+// (accounts, first positions snapshot, live stream) — see frontend-ready
+let settling = false;
+function settleBootRun(outcome: TimingOutcome) {
+    const run = getActiveTiming();
+    if (!run || settling) return;
+    settling = true;
+    releaseStream('server confirmed');
+    // separates boot's own server checks from the front-end wait below
+    markStage('boot-checked', undefined, { runId: run.id });
+    // the server is up: start the account read now rather than whenever
+    // the first panel that needs it mounts (shared, never duplicated)
+    ensureAccounts();
+    watchFrontendReady(run.id, appReadySignals(), { outcome });
+}
+
+// an app launch navigates; our own post-start reloads (and a user's F5)
+// report "reload" — only the former may open a cold-start timing run
+function pageWasReloaded(): boolean {
+    try {
+        const nav = performance.getEntriesByType('navigation')[0] as
+            | PerformanceNavigationTiming
+            | undefined;
+        return nav?.type === 'reload';
+    } catch {
+        return false;
+    }
 }
 
 // Health alone must not adopt a server: the persisted port key can be stale,
@@ -286,20 +476,33 @@ async function serverVersionOk(): Promise<boolean> {
     }
 }
 
-// In production the order_event SSE stream only emits heartbeats until
-// each account is explicitly subscribed (no-op in simulation).
-export async function subscribeProductionTradeEvents() {
-    try {
-        const info = await fetchInfo();
-        if (info.simulation) return;
-        const accounts = await fetchAccounts();
-        await Promise.all(
-            accounts
-                .filter((a) => a.signed)
-                .map((a) => subscribeTradeEvents(a)),
-        );
-    } catch (error) {
-        notify({ kind: 'err', title: '委託回報訂閱失敗', body: '資料可能過期；請使用委託分頁右側的更新圖示重試。' });
-        throw error;
-    }
+// Shioaji 1.7.7 restores the token's original trade subscriptions on cached
+// login. Check each signed account before subscribing: a duplicate subscribe
+// can clear another account's relay record on the same session (sw#183).
+// A missing/failed health route falls back to subscribe for older servers.
+// Share the account read with the early trading snapshot and update the store.
+let tradeSubscriptionInFlight: Promise<void> | null = null;
+export function subscribeTradeReports(): Promise<void> {
+    if (tradeSubscriptionInFlight) return tradeSubscriptionInFlight;
+    const run = (async () => {
+        try {
+            const accounts = await loadAccountsShared();
+            for (const account of accounts.filter(a => a.signed)) {
+                let subscribed = false;
+                try {
+                    const health = await fetchTradeCacheHealth(account.account_type as 'S' | 'F', account);
+                    subscribed = !health.reasons.some(r => r.reason === 'NotSubscribed');
+                } catch {
+                    // Pre-1.7.6 sidecar or a transient health read failure.
+                }
+                if (!subscribed) await subscribeTradeEvents(account);
+            }
+        } catch (error) {
+            notify({ kind: 'err', title: '委託回報訂閱失敗', body: '資料可能過期；請使用委託分頁右側的更新圖示重試。' });
+            throw error;
+        }
+    })();
+    tradeSubscriptionInFlight = run;
+    void run.finally(() => { tradeSubscriptionInFlight = null; }).catch(() => undefined);
+    return run;
 }

@@ -1,5 +1,7 @@
 import { remainingWorkingOrderQuantity } from '../lib/working-order-quantity';
+import { canUpdateOrderPrice, isOddLot, lotLabel } from '../lib/odd-lot';
 import { cancellationSummary } from '../lib/trade-mutations';
+import { isCancelUnconfirmed } from '../lib/cancel-verification';
 // src/components/bottom-dock-orders.tsx — 委託 tab：成交進度圈、狀態篩選、
 // 分帳戶區段、批次刪單（arm-lock 防誤觸）；inline 改價/減量沿用
 
@@ -7,6 +9,7 @@ import { ChevronDown, ChevronRight } from 'lucide-react';
 import { useEffect, useMemo, useState } from 'react';
 import {
     cancelOrder,
+    cancelOrders,
     updateOrderPrice,
     updateOrderQty,
 } from '../lib/shioaji';
@@ -16,6 +19,7 @@ import type { Trade } from '../lib/types/order';
 import { fmtInt, fmtPrice } from '../lib/utils/format';
 import { vars } from '../theme.css';
 import { Orb } from './orb';
+import { AsyncStatus } from './async-status';
 import * as panel from './panel.css';
 import * as styles from './bottom-dock.css';
 import {
@@ -94,6 +98,8 @@ function FillRing({ t }: { t: Trade }) {
 
 export function OrderQuantity({ trade }: { trade: Trade }) {
     const remaining = remainingWorkingOrderQuantity(trade);
+    // 零股委託以股計（#204）；整股／期貨維持原本不加單位
+    const unit = isOddLot(trade.order.order_lot) ? ' 股' : '';
     return (
         <span
             className={styles.ringWrap}
@@ -101,9 +107,9 @@ export function OrderQuantity({ trade }: { trade: Trade }) {
         >
             <FillRing t={trade} />
             <span className={styles.priceDual}>
-                <span>未成交 {fmtInt(remaining)}</span>
+                <span>未成交 {fmtInt(remaining)}{unit}</span>
                 <span className={styles.priceDualSub}>
-                    成交 {fmtInt(trade.status.deal_quantity)} · 取消 {fmtInt(trade.status.cancel_quantity)}
+                    成交 {fmtInt(trade.status.deal_quantity)} · 取消 {fmtInt(trade.status.cancel_quantity)}{unit}
                 </span>
             </span>
         </span>
@@ -210,11 +216,7 @@ function orderDetail(t: Trade): string {
         );
     }
     if (t.order.order_lot && t.order.order_lot !== 'Common') {
-        parts.push(
-            { IntradayOdd: '零股', Odd: '零股', Fixing: '定盤', BlockTrade: '鉅額' }[
-                t.order.order_lot
-            ] ?? t.order.order_lot,
-        );
+        parts.push(lotLabel(t.order.order_lot));
     }
     return parts.join(' ');
 }
@@ -227,6 +229,7 @@ interface OrderGroup {
 
 export function OrdersPane({
     trades,
+    initialStatus,
     mode,
     market,
     scopeKey,
@@ -236,6 +239,7 @@ export function OrdersPane({
     onShowAll,
 }: {
     trades: Trade[];
+    initialStatus: 'loading' | 'failed' | 'ready';
     mode: ViewMode;
     market: MarketFilter;
     scopeKey: string; // '' = 全部帳戶
@@ -339,25 +343,21 @@ export function OrdersPane({
             notify({ title: '刪單結果', ...cancellationSummary([{ status: 'fulfilled', value: trade }]) });
             onChanged();
         } catch (error) {
-            notify({ title: '刪單失敗或結果未知', kind: 'err', body: `${error instanceof Error ? error.message : String(error)}；請手動更新委託確認，勿自動重送` });
+            notify(isCancelUnconfirmed(error)
+                ? { title: '刪單未確認', kind: 'err', body: error.message }
+                : { title: '刪單失敗或結果未知', kind: 'err', body: `${error instanceof Error ? error.message : String(error)}；請手動更新委託確認，勿自動重送` });
         } finally {
             setCancelling(null);
         }
     };
 
-    // 批次刪單：逐筆呼叫 cancelOrder，完成回報筆數
+    // 批次刪單：同時送出各筆 cancelOrder（每筆各自回讀確認，同帳戶讀取共用），
+    // 逐筆完成時更新進度，最後回報確認筆數
     const runBatchCancel = async (ids: string[]) => {
         if (ids.length === 0 || busy || cancelling) return;
         setBusy({ done: 0, total: ids.length });
-        const results: PromiseSettledResult<Trade>[] = [];
-        for (const id of ids) {
-            try {
-                results.push({ status: 'fulfilled', value: await cancelOrder(id) });
-            } catch (reason) {
-                results.push({ status: 'rejected', reason });
-            }
-            setBusy((b) => (b ? { done: b.done + 1, total: b.total } : b));
-        }
+        const results: PromiseSettledResult<Trade>[] = await cancelOrders(ids,
+            () => setBusy((b) => (b ? { done: b.done + 1, total: b.total } : b)));
         setBusy(null);
         setSelected(new Set());
         notify({
@@ -420,7 +420,8 @@ export function OrdersPane({
                 {withEditors && (
                     <>
                         <span onClick={(e) => e.stopPropagation()}>
-                            {(t.order.price_type ?? 'LMT') === 'LMT' && (
+                            {/* 零股只能減量／刪單，不提供改價（#204） */}
+                            {canUpdateOrderPrice(t.order) && (
                                 <>
                                     <OrderEditor
                                         trade={t}
@@ -631,8 +632,13 @@ export function OrdersPane({
             <div className={styles.paneScroll}>
                 {rows.length === 0 ? (
                     <div className={styles.emptyState}>
-                        {trades.length === 0 ? (
-                            'NO ORDERS · 無委託'
+                        {initialStatus !== 'ready' ? (
+                            <AsyncStatus
+                                phase={initialStatus === 'loading' ? 'loading' : 'error'}
+                                text={initialStatus === 'loading' ? '載入委託…' : '委託尚未確認，請更新'}
+                            />
+                        ) : trades.length === 0 ? (
+                            <AsyncStatus phase='empty' text='NO ORDERS · 無委託' />
                         ) : (
                             // 有抓到委託但被篩選隱藏 — 不講清楚會被當成
                             // 「委託消失」回報（issue #19：持久化的狀態/

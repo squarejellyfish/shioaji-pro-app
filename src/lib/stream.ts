@@ -9,8 +9,17 @@ import {
     normalizeOrderEvent,
     type OrderEventReport,
 } from './order-report';
+import { reportLedger } from './report-ledger';
+import { markStage } from './startup-timing';
+import { isChildWindow } from './window-role';
+import { knownServerInfo } from './server-info-store';
+import { createSharedStream, type StreamWire } from './shared-stream';
+import { invalidateTradingMirror } from './trading-mirror-lease';
 
-export type StreamStatus = 'connecting' | 'live' | 'down';
+/** `stale`: the EventSource still looks open but no heartbeat or event
+ *  arrived within the watchdog window (e.g. the sidecar behind a proxy was
+ *  restarted). Treated like `down` everywhere: not LIVE, reconnecting. */
+export type StreamStatus = 'connecting' | 'live' | 'down' | 'stale';
 
 export interface ContractChangeEvent {
     event_id: string;
@@ -36,6 +45,9 @@ export interface QuoteState {
 type Listener = () => void;
 
 const quotes = new Map<string, QuoteState>();
+// 盤中零股（intraday_odd）行情：同一個 code 的零股 tick／五檔是另一個市場
+// （分開撮合、量以股計），存在獨立的 store，永遠不和整股行情混在一起（#204）
+const oddQuotes = new Map<string, QuoteState>();
 // continuous-month aliases (e.g. TXFR1): SSE events carry the resolved
 // contract code (e.g. TXFF6); map it back to the display code.
 const codeAlias = new Map<string, string>();
@@ -53,11 +65,19 @@ export function getAliasFor(actualCode: string): string | undefined {
 }
 let status: StreamStatus = 'connecting';
 let lastHeartbeat = 0;
+const ownerListeners = new Set<() => void>();
+export function isStreamOwner() { return shared?.isOwner() === true; }
+export function subscribeStreamOwner(listener: () => void) {
+    ownerListeners.add(listener);
+    return () => { ownerListeners.delete(listener); };
+}
 
 const quoteListeners = new Map<string, Set<Listener>>();
+const oddQuoteListeners = new Map<string, Set<Listener>>();
 const statusListeners = new Set<Listener>();
 const orderEventListeners = new Set<(ev: OrderEventReport) => void>();
 const tickTapeListeners = new Set<(tick: SseTick) => void>();
+const oddTickListeners = new Set<(tick: SseTick) => void>();
 const contractEventListeners = new Set<
     (event: ContractChangeEvent) => void
 >();
@@ -71,7 +91,7 @@ function emitFullContractRefresh(
     eventId: string,
     publishedAt: string,
 ) {
-    emitContractChange({
+    const change: ContractChangeEvent = {
         event_id: eventId,
         action,
         region: 'TW',
@@ -81,7 +101,9 @@ function emitFullContractRefresh(
         info_changed: true,
         info_scope: 'ALL',
         info_shards: [],
-    });
+    };
+    emitContractChange(change);
+    shared?.publish({ kind: 'event', name: 'contract_event', raw: JSON.stringify(change) });
 }
 
 // React 通知採 50ms 批次 — 開盤 tick 風暴（多面板×多檔訂閱）下逐筆
@@ -92,14 +114,14 @@ function emitFullContractRefresh(
 // 啟動風暴時 flush 落在 render 中間仍會觸發巢狀更新告警。
 const QUOTE_FLUSH_MS = 50;
 const dirtyQuoteCodes = new Set<string>();
+const dirtyOddQuoteCodes = new Set<string>();
 let quoteFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
-function flushQuoteEmits() {
-    quoteFlushTimer = null;
-    const codes = Array.from(dirtyQuoteCodes);
-    dirtyQuoteCodes.clear();
+function flushDirty(dirty: Set<string>, listeners: Map<string, Set<Listener>>) {
+    const codes = Array.from(dirty);
+    dirty.clear();
     for (const code of codes) {
-        quoteListeners.get(code)?.forEach((l) => {
+        listeners.get(code)?.forEach((l) => {
             // 單一 listener 拋錯不能中斷整批 flush — dirty set 已清空，
             // 中斷會讓其他 code 的更新無聲丟失直到下一筆 tick
             try {
@@ -111,8 +133,14 @@ function flushQuoteEmits() {
     }
 }
 
-function emitQuote(code: string) {
-    dirtyQuoteCodes.add(code);
+function flushQuoteEmits() {
+    quoteFlushTimer = null;
+    flushDirty(dirtyQuoteCodes, quoteListeners);
+    flushDirty(dirtyOddQuoteCodes, oddQuoteListeners);
+}
+
+function emitQuote(code: string, oddLot = false) {
+    (oddLot ? dirtyOddQuoteCodes : dirtyQuoteCodes).add(code);
     if (quoteFlushTimer === null) {
         quoteFlushTimer = setTimeout(flushQuoteEmits, QUOTE_FLUSH_MS);
     }
@@ -123,18 +151,22 @@ function setStatus(s: StreamStatus) {
         status = s;
         statusListeners.forEach((l) => l());
     }
+    if (shared?.isOwner()) shared.publish({ kind: 'status', status: s, heartbeat: lastHeartbeat });
 }
 
 function handleTick(raw: string) {
     const tick = JSON.parse(raw) as SseTick;
-    if (tick.intraday_odd) return; // board shows regular-lot stream only
+    if (tick.intraday_odd) {
+        // 零股：獨立 store、不進 onAnyTick（成交明細／整股觸價只看整股）
+        ingestOddTick(tick);
+        return;
+    }
     ingestTick(tick);
     const alias = codeAlias.get(tick.code);
     if (alias) ingestTick({ ...tick, code: alias });
 }
 
-function ingestTick(tick: SseTick) {
-    const prev = quotes.get(tick.code);
+function nextTickState(prev: QuoteState | undefined, tick: SseTick): QuoteState {
     const prevClose = prev?.tick ? Number(prev.tick.close) : undefined;
     const close = Number(tick.close);
     const lastDir: QuoteState['lastDir'] =
@@ -143,40 +175,58 @@ function ingestTick(tick: SseTick) {
             : close > prevClose
               ? 1
               : -1;
-    // flash only on real deals — simtrade (試撮) updates must not blink
     const isRealTrade = !tick.simtrade && tick.volume > 0;
-    quotes.set(tick.code, {
+    return {
         tick,
         bidask: prev?.bidask,
         index: prev?.index,
         lastDir,
         seq: (prev?.seq ?? 0) + 1,
         flashSeq: (prev?.flashSeq ?? 0) + (isRealTrade ? 1 : 0),
-    });
+    };
+}
+
+function ingestOddTick(tick: SseTick) {
+    oddQuotes.set(tick.code, nextTickState(oddQuotes.get(tick.code), tick));
+    emitQuote(tick.code, true);
+    if (!tick.simtrade && tick.volume > 0) oddTickListeners.forEach((l) => l(tick));
+}
+
+function ingestTick(tick: SseTick) {
+    const state = nextTickState(quotes.get(tick.code), tick);
+    quotes.set(tick.code, state);
     emitQuote(tick.code);
-    if (isRealTrade) {
+    // flash only on real deals — simtrade (試撮) updates must not blink
+    if (!tick.simtrade && tick.volume > 0) {
         tickTapeListeners.forEach((l) => l(tick));
     }
 }
 
-function handleBidAsk(raw: string) {
-    const bidask = JSON.parse(raw) as SseBidAsk;
-    if (bidask.intraday_odd) return;
-    ingestBidAsk(bidask);
-    const alias = codeAlias.get(bidask.code);
-    if (alias) ingestBidAsk({ ...bidask, code: alias });
-}
-
-function ingestBidAsk(bidask: SseBidAsk) {
-    const prev = quotes.get(bidask.code);
-    quotes.set(bidask.code, {
+function nextBidAskState(prev: QuoteState | undefined, bidask: SseBidAsk): QuoteState {
+    return {
         tick: prev?.tick,
         bidask,
         index: prev?.index,
         lastDir: prev?.lastDir ?? 0,
         seq: (prev?.seq ?? 0) + 1,
         flashSeq: prev?.flashSeq ?? 0,
-    });
+    };
+}
+
+function handleBidAsk(raw: string) {
+    const bidask = JSON.parse(raw) as SseBidAsk;
+    if (bidask.intraday_odd) {
+        oddQuotes.set(bidask.code, nextBidAskState(oddQuotes.get(bidask.code), bidask));
+        emitQuote(bidask.code, true);
+        return;
+    }
+    ingestBidAsk(bidask);
+    const alias = codeAlias.get(bidask.code);
+    if (alias) ingestBidAsk({ ...bidask, code: alias });
+}
+
+function ingestBidAsk(bidask: SseBidAsk) {
+    quotes.set(bidask.code, nextBidAskState(quotes.get(bidask.code), bidask));
     emitQuote(bidask.code);
 }
 
@@ -283,11 +333,21 @@ export function registerSubscription(body: {
     quote_type: string;
     intraday_odd: boolean;
 }) {
-    subscriptionRegistry.set(`${body.code}:${body.quote_type}`, body);
+    subscriptionRegistry.set(subscriptionKey(body.code, body.quote_type, body.intraday_odd), body);
 }
 
-export function unregisterSubscription(code: string, quoteType: string) {
-    subscriptionRegistry.delete(`${code}:${quoteType}`);
+/** 整股與零股是兩個獨立訂閱：key 帶零股旗標，重連重播兩者都會還原 */
+function subscriptionKey(code: string, quoteType: string, oddLot = false) {
+    return `${code}:${quoteType}${oddLot ? ':odd' : ''}`;
+}
+
+export function unregisterSubscription(code: string, quoteType: string, oddLot = false) {
+    subscriptionRegistry.delete(subscriptionKey(code, quoteType, oddLot));
+}
+
+/** Bodies replayed after a reconnect (diagnostics / tests). */
+export function getRegisteredSubscriptions(): Record<string, unknown>[] {
+    return [...subscriptionRegistry.values()];
 }
 
 // 巢狀 body 的訂閱（如 managed 組合合約 {contract:{legs,...}}）— key 用
@@ -314,9 +374,39 @@ export function unregisterCapabilitySubscription(key: string) {
 
 let resubscribeRetryTimer: ReturnType<typeof setTimeout> | null = null;
 
-async function resubscribeAll() {
+// Replay after a reconnect is paced: Shioaji documents 50 subscriptions per
+// 5 s. A restart/stale reconnect (now also driven by the heartbeat watchdog)
+// must not burst the whole registry at once. One replay at a time.
+export const REPLAY_BATCH = 40;
+export const REPLAY_WINDOW_MS = 5000;
+let replaying: Promise<void> | null = null;
+let replayAgain = false;
+function replay(onlyCapabilities: boolean): Promise<void> {
+    if (replaying) { replayAgain = true; return replaying; }
+    replaying = replayOnce(onlyCapabilities).finally(() => {
+        replaying = null;
+        if (replayAgain) { replayAgain = false; void resubscribeAll(); }
+    });
+    return replaying;
+}
+function resubscribeAll(): Promise<void> { return replay(false); }
+function resubscribeCapabilities(): Promise<void> {
+    return capabilityRegistry.size ? replay(true) : Promise.resolve();
+}
+async function replayOnce(onlyCapabilities = false) {
     let failed = false;
-    for (const body of subscriptionRegistry.values()) {
+    let sent = 0;
+    let windowStart = Date.now();
+    const pace = async () => {
+        if (sent > 0 && sent % REPLAY_BATCH === 0) {
+            const wait = windowStart + REPLAY_WINDOW_MS - Date.now();
+            if (wait > 0) await new Promise(r => setTimeout(r, wait));
+            windowStart = Date.now();
+        }
+        sent++;
+    };
+    for (const body of onlyCapabilities ? [] : [...subscriptionRegistry.values()]) {
+        await pace();
         try {
             const response = await apiPost<{ success?: boolean; message?: string }>(
                 '/api/v1/stream/subscribe',
@@ -329,7 +419,8 @@ async function resubscribeAll() {
             failed = true;
         }
     }
-    for (const { path, body } of capabilityRegistry.values()) {
+    for (const { path, body } of [...capabilityRegistry.values()]) {
+        await pace();
         try {
             const response = await apiPost<{ success: boolean; message: string }>(
                 `/api/v1/stream/subscribe/${path}`,
@@ -349,6 +440,7 @@ async function resubscribeAll() {
 }
 
 let es: EventSource | null = null;
+let shared: ReturnType<typeof createSharedStream> | null = null;
 let retryTimer: ReturnType<typeof setTimeout> | null = null;
 let retryDelay = 1000;
 let everDown = false;
@@ -359,12 +451,24 @@ let everDown = false;
 // opening dedicated per-channel EventSources (six HTTP/1.1 streams used
 // to exhaust the browser's per-origin connection pool).
 const namedListeners = new Map<string, Set<(raw: string) => void>>();
+// These families may have consumers only in follower popouts. The owner must
+// subscribe to their SSE names even when it has no local listener.
+const sharedNamedEvents = ['index_components', 'calculated_index', 'scanner', 'heartbeat'];
+const attachedNamed = new Set<string>();
 
 function attachNamed(source: EventSource, name: string) {
+    if (attachedNamed.has(name)) return;
+    attachedNamed.add(name);
     source.addEventListener(name, (event) => {
-        const set = namedListeners.get(name);
-        set?.forEach((listener) => listener((event as MessageEvent).data));
+        markActivity();
+        dispatchNamed(name, (event as MessageEvent).data);
     });
+}
+
+function dispatchNamed(name: string, raw: string) {
+    // heartbeat is already forwarded by the core listener below.
+    if (name !== 'heartbeat') shared?.publish({ kind: 'event', name, raw });
+    namedListeners.get(name)?.forEach((listener) => listener(raw));
 }
 
 export function onStreamEvent(
@@ -383,14 +487,218 @@ export function onStreamEvent(
     };
 }
 
+// ---- heartbeat watchdog ----
+// The sidecar heartbeats every 30 s (1.7.5/1.7.6; docs/design/debug-monitor.md).
+// A proxied EventSource can stay "open" after the sidecar behind it died, so
+// silence longer than two periods plus slack marks the stream STALE, closes
+// it and reconnects through the normal backoff. Local only: the watchdog never
+// issues any HTTP request itself.
+export const HEARTBEAT_PERIOD_MS = 30_000;
+export const STALE_AFTER_MS = 2 * HEARTBEAT_PERIOD_MS + 15_000;
+export const WATCHDOG_TICK_MS = 5000;
+// A check this late means the WebView/tab was suspended: queued events may
+// not have been delivered yet, so allow one heartbeat period before STALE.
+const RESUME_GAP_MS = 15_000;
+// Connections that open but never deliver a heartbeat (e.g. a buffering
+// proxy) keep escalating the retry delay instead of resetting to 1 s.
+const SILENT_RETRY_MAX_MS = 5 * 60_000;
+let lastActivity = 0;
+let lastCheckAt = 0;
+let graceUntil = 0;
+let heartbeatSinceOpen = false;
+let silentConnections = 0;
+let watchdogTimer: ReturnType<typeof setInterval> | null = null;
+function markActivity() {
+    lastActivity = Date.now();
+}
+const NORMAL_RETRY_MAX_MS = 15_000;
+/** `cap` bounds this and the following delay: connection errors use the
+ *  normal backoff; only a connection that opened but never delivered a
+ *  heartbeat may escalate beyond it. */
+function scheduleReconnect(cap = NORMAL_RETRY_MAX_MS, fixedDelayMs?: number) {
+    everDown = true;
+    es?.close();
+    es = null;
+    if (retryTimer) clearTimeout(retryTimer);
+    if (fixedDelayMs !== undefined) {
+        // one-off quick retry: leaves the backoff sequence untouched
+        retryTimer = setTimeout(() => { if (shared?.isOwner()) connect(); }, fixedDelayMs);
+        return;
+    }
+    const delay = Math.min(retryDelay, cap);
+    retryTimer = setTimeout(() => { if (shared?.isOwner()) connect(); }, delay);
+    retryDelay = Math.min(delay * 2, cap);
+}
+
+// ---- first connection of this page (startup, issue #142) ----
+// Native timing showed LIVE landing a steady ~3.5 s after the SSE connect
+// although the sidecar answers the stream at once (its heartbeat interval's
+// first tick is immediate) — the shape of two failed attempts under the
+// 1 s → 2 s backoff. Until this page's stream has opened once, the first
+// few failures retry after 250 ms instead; after that (or once it opened)
+// the normal backoff applies unchanged. Marks record exactly what happened.
+export const STARTUP_FAST_RETRIES = 3;
+export const STARTUP_RETRY_MS = 250;
+// a drop in the first seconds of a page (the connection opened during page
+// load) is treated like a startup failure too
+export const STARTUP_WINDOW_MS = 15_000;
+let openedOnce = false;
+let openedAt: number | null = null;
+let startupFailures = 0;
+let heartbeatSeen = false;
+const pageAge = () =>
+    typeof performance !== 'undefined' && typeof performance.now === 'function'
+        ? performance.now()
+        : Number.POSITIVE_INFINITY;
+/** When this page's stream first opened (epoch ms), or null. */
+export function streamOpenedAt(): number | null {
+    return openedAt;
+}
+// Every stream mark names its page: a cold start spans two pages (before
+// and after the post-start reload), each with its own connection, and one
+// timeline must not read as "the stream opened, then was replaced".
+const PAGE_TAG = typeof performance !== 'undefined' && performance.timeOrigin
+    ? `page=${Math.round(performance.timeOrigin) % 100_000}`
+    : 'page=?';
+let connectStartedAt = 0;
+function markStream(
+    stage: 'stream-connect' | 'stream-open' | 'stream-error' | 'stream-heartbeat' | 'stream-restart',
+    detail?: string,
+) {
+    if (!isChildWindow()) markStage(stage, detail ? `${PAGE_TAG} ${detail}` : PAGE_TAG);
+}
+
+// ---- cold-start hold ----
+// On a cold start the first page only exists until the server turns healthy
+// and boot reloads it: a stream opened there connects to a server that is
+// not up yet (the failures seen natively) and is torn down by the reload a
+// moment later. Boot holds the connection on that page and releases it on
+// every path that does NOT reload; the hold also expires on its own so a
+// missed release can never leave the App without a stream.
+export const STREAM_HOLD_MAX_MS = 30_000;
+let held = false;
+let holdTimer: ReturnType<typeof setTimeout> | null = null;
+let pendingConnect = false;
+export function holdStream() {
+    if (held || started) return; // only before the first connection
+    held = true;
+    holdTimer = setTimeout(() => releaseStream('hold expired'), STREAM_HOLD_MAX_MS);
+}
+export function releaseStream(reason = 'released') {
+    if (!held) return;
+    held = false;
+    if (holdTimer) clearTimeout(holdTimer);
+    holdTimer = null;
+    if (pendingConnect) {
+        pendingConnect = false;
+        if (shared?.isOwner()) startConnection(reason);
+    }
+}
+let lastCheckGap = 0;
+function checkWatchdog() {
+    if (shared && !shared.isOwner()) return;
+    const now = Date.now();
+    const gap = lastCheckAt > 0 ? now - lastCheckAt : 0;
+    // One grace per resume: only when this check is late but the previous one
+    // was on time and the stream was not already silent then. A throttled
+    // background timer (every 20–60 s) is late on every check and must not
+    // renew the grace forever.
+    const staleAtPreviousCheck = lastActivity > 0 && lastCheckAt - lastActivity > STALE_AFTER_MS;
+    if (gap > RESUME_GAP_MS && lastCheckGap <= RESUME_GAP_MS && !staleAtPreviousCheck && now >= graceUntil) {
+        graceUntil = now + HEARTBEAT_PERIOD_MS;
+    }
+    lastCheckGap = gap;
+    lastCheckAt = now;
+    if (!es || status !== 'live' || !lastActivity) return;
+    if (now < graceUntil || now - lastActivity <= STALE_AFTER_MS) return;
+    const silent = !heartbeatSinceOpen;
+    if (silent) silentConnections++;
+    setStatus('stale');
+    markStream('stream-restart', `reason=${silent ? 'silent' : 'stale'}`);
+    scheduleReconnect(silent ? SILENT_RETRY_MAX_MS : NORMAL_RETRY_MAX_MS);
+}
+/** Watchdog diagnostics for Debug: consecutive connections that opened but
+ *  went stale without any heartbeat, and the current retry delay. */
+export function getStreamWatchdog() {
+    return { silentConnections, retryDelayMs: retryDelay, staleAfterMs: STALE_AFTER_MS };
+}
+
+function listen(source: EventSource, name: string, handler: (event: MessageEvent) => void) {
+    source.addEventListener(name, (event) => {
+        markActivity();
+        const message = event as MessageEvent;
+        shared?.publish({ kind: 'event', name, raw: message.data });
+        handler(message);
+    });
+}
+
+function dispatchWire(wire: StreamWire) {
+    if (wire.kind === 'status') {
+        if (wire.heartbeat) lastHeartbeat = wire.heartbeat;
+        setStatus(wire.status);
+        return;
+    }
+    markActivity();
+    const { name, raw } = wire;
+    if (name === 'tick_stk' || name === 'tick_fop') handleTick(raw);
+    else if (name === 'bidask_stk' || name === 'bidask_fop') handleBidAsk(raw);
+    else if (name === 'quote_idx') handleIndexQuote(raw);
+    else if (name === 'order_event') handleOrderEvent(raw);
+    else if (name === 'contract_event') {
+        const change = JSON.parse(raw) as ContractChangeEvent;
+        emitContractChange(change);
+        // Each popout owns its capability subscriptions. A new SSE owner
+        // cannot replay another window's local registry, so each follower
+        // restores its own after a reconnect or daily maintenance.
+        if (change.action === 'RECONNECT' || change.action === 'MAINTENANCE') void resubscribeCapabilities();
+    }
+    else if (name === 'heartbeat') {
+        lastHeartbeat = Date.now();
+        setStatus('live');
+    }
+    // heartbeat also has a named subscriber (trigger activity).
+    if (namedListeners.has(name)) namedListeners.get(name)?.forEach(listener => listener(raw));
+}
+
+function handleOrderEvent(raw: string) {
+    const report = normalizeOrderEvent(JSON.parse(raw));
+    if (!report) return;
+    const admitted = reportLedger.admit(
+        { base: getApiBase(), simulation: knownServerInfo()?.simulation },
+        report.eventId,
+        report.kind,
+    );
+    if (admitted.duplicate) return;
+    orderEventListeners.forEach((l) => l(report));
+}
+
 function connect() {
-    if (es) es.close();
-    setStatus('connecting');
+    // Only the Web Locks owner may create an EventSource, including retries
+    // queued before ownership was handed to another window.
+    if (shared && !shared.isOwner()) return;
+    if (es) {
+        // never expected while a connection is live: record it if it happens
+        markStream('stream-restart', 'reason=connect-while-open');
+        es.close();
+    }
+    connectStartedAt = Date.now();
+    // Keep STALE visible until the reconnect actually opens.
+    setStatus(status === 'stale' ? 'stale' : 'connecting');
     // region filters contract_event only; other families are unfiltered
     es = new EventSource(`${getStreamBase()}/api/v1/stream/data?region=TW`);
+    attachedNamed.clear();
 
     es.onopen = () => {
-        retryDelay = 1000;
+        if (!openedOnce) {
+            openedOnce = true;
+            openedAt = Date.now();
+            markStream('stream-open', `failures=${startupFailures} after=${openedAt - connectStartedAt}ms`);
+        }
+        // A connection only proves healthy once a heartbeat arrives; until
+        // then keep the backoff so silent connections do not loop every ~80 s.
+        if (silentConnections === 0) retryDelay = 1000;
+        heartbeatSinceOpen = false;
+        markActivity();
         setStatus('live');
         // SSE does not replay contract changes missed while disconnected —
         // re-query on every successful connection so a daily update cannot
@@ -404,44 +712,54 @@ function connect() {
     };
 
     for (const ev of ['tick_stk', 'tick_fop']) {
-        es.addEventListener(ev, (e) => handleTick((e as MessageEvent).data));
+        listen(es, ev, (e) => handleTick((e as MessageEvent).data));
     }
     for (const ev of ['bidask_stk', 'bidask_fop']) {
-        es.addEventListener(ev, (e) => handleBidAsk((e as MessageEvent).data));
+        listen(es, ev, (e) => handleBidAsk((e as MessageEvent).data));
     }
-    es.addEventListener('quote_idx', (e) =>
+    listen(es, 'quote_idx', (e) =>
         handleIndexQuote((e as MessageEvent).data),
     );
-    es.addEventListener('order_event', (e) => {
-        // the server wraps the body one level under its variant name
-        // ({state, data:{FuturesOrder:{...}}}) — normalize before fan-out
-        const report = normalizeOrderEvent(
-            JSON.parse((e as MessageEvent).data),
-        );
-        if (report) orderEventListeners.forEach((l) => l(report));
-    });
-    es.addEventListener('contract_event', (event) => {
+    listen(es, 'order_event', (e) => handleOrderEvent(e.data));
+    listen(es, 'contract_event', (event) => {
         const change = JSON.parse(
             (event as MessageEvent).data,
         ) as ContractChangeEvent;
         emitContractChange(change);
     });
-    es.addEventListener('heartbeat', () => {
+    listen(es, 'heartbeat', () => {
+        if (!heartbeatSeen) {
+            heartbeatSeen = true;
+            markStream('stream-heartbeat');
+        }
         lastHeartbeat = Date.now();
+        heartbeatSinceOpen = true;
+        silentConnections = 0;
+        retryDelay = 1000;
         setStatus('live');
     });
-    for (const name of namedListeners.keys()) {
+    for (const name of [...sharedNamedEvents, ...namedListeners.keys()]) {
         attachNamed(es, name);
     }
 
     es.onerror = () => {
-        everDown = true;
+        if (shared && !shared.isOwner()) return;
         setStatus('down');
-        es?.close();
-        es = null;
-        if (retryTimer) clearTimeout(retryTimer);
-        retryTimer = setTimeout(connect, retryDelay);
-        retryDelay = Math.min(retryDelay * 2, 15000);
+        if (!openedOnce || pageAge() < STARTUP_WINDOW_MS) {
+            startupFailures++;
+            const fast = startupFailures <= STARTUP_FAST_RETRIES;
+            markStream(
+                'stream-error',
+                `failure=${startupFailures}${openedOnce ? ' after open' : ''} retry=${fast ? STARTUP_RETRY_MS : Math.min(retryDelay, NORMAL_RETRY_MAX_MS)}ms`,
+            );
+            if (fast) {
+                scheduleReconnect(NORMAL_RETRY_MAX_MS, STARTUP_RETRY_MS);
+                return;
+            }
+        }
+        // A refused/failed connection is a normal outage (e.g. sidecar
+        // restarting): normal backoff, even after silent connections.
+        scheduleReconnect(NORMAL_RETRY_MAX_MS);
     };
 }
 
@@ -451,6 +769,7 @@ function connect() {
 let lastMaintenance: string | null = null;
 
 async function watchMaintenance() {
+    if (shared && !shared.isOwner()) return;
     try {
         const res = await fetch(`${getApiBase()}/api/v1/health`);
         if (!res.ok) return;
@@ -477,19 +796,50 @@ let started = false;
 export function ensureStream() {
     if (!started) {
         started = true;
-        connect();
-        void watchMaintenance();
+        shared = createSharedStream({
+            name: `sj-market-stream:${typeof location === 'undefined' ? 'test' : location.origin}:${getApiBase()}:${getStreamBase()}`,
+            main: !isChildWindow(),
+            onOwn: () => {
+                if (isChildWindow()) invalidateTradingMirror();
+                ownerListeners.forEach(listener => listener());
+                everDown = true;
+                if (held) pendingConnect = true;
+                else startConnection();
+            },
+            onRelease: () => {
+                ownerListeners.forEach(listener => listener());
+                pendingConnect = false;
+                es?.close();
+                es = null;
+                if (retryTimer) clearTimeout(retryTimer);
+                retryTimer = null;
+                setStatus('connecting');
+            },
+            onWire: dispatchWire,
+            onMissing: () => { if (status === 'live') setStatus('down'); },
+            snapshot: () => ({ kind: 'status', status, heartbeat: lastHeartbeat }),
+        });
+        lastCheckAt = Date.now();
+        watchdogTimer = setInterval(checkWatchdog, WATCHDOG_TICK_MS);
         setInterval(watchMaintenance, 60000);
     }
 }
 
+function startConnection(reason?: string) {
+    if (shared && !shared.isOwner()) return;
+    markStream('stream-connect', reason);
+    connect();
+    void watchMaintenance();
+}
+
 // ---- store API (for useSyncExternalStore) ----
 
-export function subscribeQuoteStore(code: string, listener: Listener) {
-    let set = quoteListeners.get(code);
+export function subscribeQuoteStore(code: string, listener: Listener, oddLot = false) {
+    const listeners = oddLot ? oddQuoteListeners : quoteListeners;
+    let set = listeners.get(code);
     if (!set) {
         set = new Set();
-        quoteListeners.set(code, set);
+        listeners.set(code, set);
     }
     set.add(listener);
     return () => {
@@ -497,8 +847,9 @@ export function subscribeQuoteStore(code: string, listener: Listener) {
     };
 }
 
-export function getQuote(code: string): QuoteState | undefined {
-    return quotes.get(code);
+/** `oddLot`: the 盤中零股 store (shares), never the regular-lot one. */
+export function getQuote(code: string, oddLot = false): QuoteState | undefined {
+    return (oddLot ? oddQuotes : quotes).get(code);
 }
 
 export function subscribeStatusStore(listener: Listener) {
@@ -534,6 +885,14 @@ export function onAnyTick(listener: (tick: SseTick) => void) {
     };
 }
 
+/** Real (non-simtrade) 盤中零股 trades — kept apart from onAnyTick. */
+export function onOddLotTick(listener: (tick: SseTick) => void) {
+    oddTickListeners.add(listener);
+    return () => {
+        oddTickListeners.delete(listener);
+    };
+}
+
 export function onContractEvent(
     listener: (event: ContractChangeEvent) => void,
 ) {
@@ -547,6 +906,7 @@ export function onContractEvent(
 // SSE 連線與殭屍 listener（每 tick 重複灌、CPU 飆高）。一變更就整頁
 // 重載，開發期不會再累積疊層。
 if (import.meta.hot) {
+    import.meta.hot.dispose(() => { if (watchdogTimer) clearInterval(watchdogTimer); shared?.close(); es?.close(); });
     import.meta.hot.accept(() => {
         import.meta.hot?.invalidate();
     });

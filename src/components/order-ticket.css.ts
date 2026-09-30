@@ -130,6 +130,8 @@ const segBase = style({
     borderRadius: vars.radius.sm,
     color: vars.color.mutedForeground,
     transition: 'all 0.12s',
+    // 不支援的組合（例：零股的市價／IOC）顯示為停用，title 說明原因
+    ':disabled': { opacity: 0.35, cursor: 'not-allowed' },
 });
 
 export const seg = styleVariants({
@@ -493,3 +495,17 @@ export const feedback = style({
     whiteSpace: 'pre-wrap',
     wordBreak: 'break-all',
 });
+
+// 括號單 損/利：兩個價格欄在窄面板（~200px）時換行成兩列，不裁切數字
+export const bracketInputs = style({
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: vars.space.xs,
+    flex: 1,
+    minWidth: 0,
+});
+
+export const bracketInput = style([numInput, {
+    flex: '1 1 5.5rem',
+    minWidth: '5.5rem',
+}]);

@@ -1,6 +1,9 @@
 import { getApiBase } from './runtime';
 import { remainingWorkingOrderQuantity } from './working-order-quantity';
-import { observeTradeMutation } from './trade-mutations';
+import { noteMutationIntent } from './mutation-intent';
+import { isOddLot, ODD_LOT_NO_PRICE_UPDATE, stockOrderProblem } from './odd-lot';
+import { markConfirmedCancellation, observeTradeMutation } from './trade-mutations';
+import { createCancelBatch, readMark, sharedAuthoritativeTrades, verifyCancellation, type CancelBatchMember } from './cancel-verification';
 import { observeMarketSnapshots } from './market-snapshot-store';
 import { observeTradeResponse } from './trade-observations';
 import { beginServerInfoRequest, observeServerInfo } from './server-info-store';
@@ -37,6 +40,7 @@ import type {
     FuturesOrderReq,
     StockOrderReq,
     Trade,
+    TradeCacheHealth,
 } from './types/order';
 import type {
     Account,
@@ -89,8 +93,9 @@ function streamContractKey(c: ContractBase) {
 
 // ---- health / info / auth ----
 
-export function fetchHealth() {
-    return apiGet<Health>('/api/v1/health');
+// signal: lets a poller abort a hung probe so attempts never overlap
+export function fetchHealth(opts?: { signal?: AbortSignal }) {
+    return apiGet<Health>('/api/v1/health', opts);
 }
 
 export function fetchInfo() {
@@ -307,6 +312,7 @@ export function fetchOptions(
         strikeMax?: number;
         expiryWeekday?: string;
     } = {},
+    opts?: { signal?: AbortSignal },
 ) {
     return apiGet<ContractInfo[]>(
         `/api/v1/data/contracts/options${contractQuery({
@@ -318,12 +324,14 @@ export function fetchOptions(
             expiry_weekday: filters.expiryWeekday,
             region: 'TW',
         })}`,
+        opts,
     );
 }
 
-export function fetchOptionRoots() {
+export function fetchOptionRoots(opts?: { signal?: AbortSignal }) {
     return apiGet<ContractRoot[]>(
         '/api/v1/data/contracts/options/roots?region=TW',
+        opts,
     );
 }
 
@@ -430,13 +438,21 @@ export function fetchScanner(
 
 // ---- streaming subscriptions ----
 
+export interface QuoteSubscribeOptions {
+    /** 盤中零股行情（intraday_odd）— 與整股是兩個獨立訂閱（#204） */
+    oddLot?: boolean;
+}
+
 export function subscribeQuote(
     contract: ContractBase,
     quoteType: QuoteTypeName,
+    options?: QuoteSubscribeOptions,
 ) {
+    const oddLot = options?.oddLot === true;
     // 組合商品走巢狀腳訂閱（flat code 如 TXFI6/J6 server 不認）
     const comboMeta = (contract as { combo?: unknown }).combo;
     if (comboMeta) {
+        if (oddLot) return Promise.reject(new Error('組合商品沒有零股行情'));
         return subscribeComboQuote(
             comboMeta as Parameters<typeof subscribeComboQuote>[0],
             quoteType,
@@ -447,7 +463,7 @@ export function subscribeQuote(
         // empty string must become null — the server 500s on target_code ""
         target_code: contract.target_code || null,
         quote_type: quoteType,
-        intraday_odd: false,
+        intraday_odd: oddLot,
     };
     return apiPost<SubscriptionResponse>('/api/v1/stream/subscribe', body).then(
         (response) => {
@@ -463,9 +479,11 @@ export function subscribeQuote(
 export function unsubscribeQuote(
     contract: ContractBase,
     quoteType: QuoteTypeName,
+    options?: QuoteSubscribeOptions,
 ) {
+    const oddLot = options?.oddLot === true;
     const comboMeta = (contract as { combo?: unknown }).combo;
-    if (comboMeta) {
+    if (comboMeta && !oddLot) {
         return unsubscribeComboQuote(
             comboMeta as Parameters<typeof unsubscribeComboQuote>[0],
             quoteType,
@@ -474,12 +492,12 @@ export function unsubscribeQuote(
     return apiPost<SubscriptionResponse>('/api/v1/stream/unsubscribe', {
         ...contractKey(contract),
         quote_type: quoteType,
-        intraday_odd: false,
+        intraday_odd: oddLot,
     }).then((response) => {
         if (!response.success) {
             throw new Error(response.message || '取消行情訂閱失敗');
         }
-        unregisterSubscription(contract.code, quoteType);
+        unregisterSubscription(contract.code, quoteType, oddLot);
         return response;
     });
 }
@@ -766,6 +784,9 @@ export function placeStockOrder(
     account?: Account,
     opts?: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean },
 ) {
+    // 零股不支援的組合（融資券／當沖／市價／IOC／超過 999 股）一律在送出前擋下（#204）
+    const problem = stockOrderProblem(order);
+    if (problem) return Promise.reject(Object.assign(new Error(problem), { mutationNotStarted: true as const }));
     const selected = account ?? accountFor('S');
     return apiPost<Trade>('/api/v1/order/place_order', {
         contract: contractKey(contract),
@@ -786,14 +807,29 @@ export function placeFuturesOrder(
     }, opts).then(ensureAccepted).then(trade => observeTradeResponse(trade, selected));
 }
 
-/** Temporary workaround: https://github.com/Sinotrade/Shioaji/issues/235
- * Remove after upstream cache hydration is fixed and native futures change/cancel
- * succeeds without update_status. Explicit preflight only; no polling or retry.
+/** Preflight for cancel/update. Shioaji 1.7.6 fixed Sinotrade/Shioaji#235
+ * (production futures cache lacked ordno), so the temporary same-account
+ * update_status before every futures mutation is gone. The request still
+ * needs one unambiguous local order of a signed account whose market matches
+ * the product, on the server that is still current.
+ *
+ * trade_id only exists in the sidecar process that observed the order. When
+ * the App has no authoritative baseline on the current sidecar instance (e.g.
+ * it restarted outside the App), run ONE authoritative update_status for that
+ * account and re-resolve the trade_id by the order's known identifiers. No
+ * polling, no retry; any doubt refuses before dispatch.
  */
-async function prepareOrderMutation(tradeId: string): Promise<string> {
+// trading-state imports this module; load it lazily, once, and share the
+// promise so concurrent mutations (a cancel-all batch) resolve the same module.
+let tradingStateModule: Promise<typeof import('./trading-state')> | null = null;
+const loadTradingState = () => (tradingStateModule ??= import('./trading-state'));
+
+async function prepareOrderMutation(tradeId: string): Promise<{ base: string; tradeId: string; trade: Trade; account: Account; tradingState: typeof import('./trading-state') }> {
     const base = getApiBase();
+    const requestedMark = readMark();
     const refuse = (message: string): never => { throw Object.assign(new Error(message), { mutationNotStarted: true }); };
-    const { getTradingState } = await import('./trading-state');
+    const tradingState = await loadTradingState();
+    const { getTradingState, hasOrdersBaseline } = tradingState;
     if (base !== getApiBase()) refuse('伺服器已切換，未送出改刪單');
     const matches = getTradingState().trades.filter(t => t.order.id === tradeId);
     if (matches.length !== 1) refuse('委託或帳戶歸屬不明，請先手動更新委託；未送出改刪單');
@@ -806,74 +842,123 @@ async function prepareOrderMutation(tradeId: string): Promise<string> {
     if (!account) refuse('缺少已驗證的委託帳戶，未送出改刪單');
     const futures = ['FUT', 'OPT'].includes(trade.contract.security_type ?? '');
     if (account!.account_type !== (futures ? 'F' : 'S')) refuse('商品與委託帳戶不符，未送出改刪單');
-    if (!futures) return base; // Stock mutations retain their existing zero-query path.
-    let rows: Trade[];
-    try { rows = await fetchTrades('F', account!); }
-    catch (error) {
-        throw Object.assign(error instanceof Error ? error : new Error(String(error)), { mutationNotStarted: true });
-    }
+    if (hasOrdersBaseline()) return { base, tradeId, trade, account: account!, tradingState };
+    const seqno = trade.order.seqno?.trim();
+    const ordno = trade.order.ordno?.trim();
+    if (!seqno && !ordno) refuse('伺服器委託基準未建立且委託缺少序號，請先手動更新委託；未送出改刪單');
+    // The read only has to find trade_ids on the current sidecar instance, so
+    // any authoritative read of this account started after the baseline was
+    // lost is shared (one per account per baseline loss, e.g. a whole popout
+    // cancel-all). Only an order missing from that read gets one fresh read.
+    const read = async (mark: number) => {
+        try { return await sharedAuthoritativeTrades(base, account!, mark, () => fetchTrades(account!.account_type as 'S' | 'F', account!, { refresh: true })); }
+        catch (error) { throw Object.assign(error instanceof Error ? error : new Error(String(error)), { mutationNotStarted: true }); }
+    };
+    const code = (t: Trade) => t.contract.target_code || t.contract.code;
+    const resolveId = (rows: Trade[]) => {
+        const candidates = rows.filter(r => (!r.order.account || (r.order.account.broker_id === account!.broker_id && r.order.account.account_id === account!.account_id))
+            && ((seqno && r.order.seqno === seqno) || (ordno && r.order.ordno === ordno)));
+        const found = candidates[0];
+        if (candidates.length !== 1 || !found
+            || (seqno && found.order.seqno && found.order.seqno !== seqno) || (ordno && found.order.ordno && found.order.ordno !== ordno)
+            || found.order.action !== trade.order.action || code(found) !== code(trade)
+            || remainingWorkingOrderQuantity(found) <= 0 || !found.order.id) return null;
+        return found;
+    };
+    const lostMark = tradingState.ordersBaselineLostMark();
+    let found = resolveId(await read(lostMark));
+    if (!found && lostMark < requestedMark) found = resolveId(await read(requestedMark));
     if (base !== getApiBase()) refuse('對帳期間伺服器已切換，未送出改刪單');
-    const current = rows.filter(t => t.order.id === tradeId
-        && t.order.account?.account_type === account!.account_type
-        && t.order.account?.broker_id === account!.broker_id
-        && t.order.account?.account_id === account!.account_id);
-    const latest = getTradingState().trades.filter(t => t.order.id === tradeId);
-    const agreesWithKnownIdentifiers = (candidate: Trade, known: Trade) =>
-        (['seqno', 'ordno'] as const).every(key => !known.order[key]?.trim() || candidate.order[key] === known.order[key]);
-    const sameAmounts = (candidate: Trade) => candidate.order.quantity === trade.order.quantity
-        && candidate.status.deal_quantity === trade.status.deal_quantity
-        && candidate.status.cancel_quantity === trade.status.cancel_quantity;
-    if (!getAccountState().accounts.some(a => a.signed && a.account_type === account!.account_type
-        && a.broker_id === account!.broker_id && a.account_id === account!.account_id)
-        || latest.length !== 1 || !agreesWithKnownIdentifiers(latest[0]!, trade)
-        || (latest[0]!.account ?? latest[0]!.order.account)?.account_type !== account!.account_type
-        || (latest[0]!.account && latest[0]!.order.account && (['account_type', 'broker_id', 'account_id'] as const).some(
-            key => latest[0]!.account![key] !== latest[0]!.order.account![key]))
-        || latest[0]!.order.action !== trade.order.action
-        || (latest[0]!.contract.target_code || latest[0]!.contract.code) !== (trade.contract.target_code || trade.contract.code)
-        || !sameAmounts(latest[0]!) || remainingWorkingOrderQuantity(latest[0]!) <= 0
-        || (latest[0]!.account ?? latest[0]!.order.account)?.account_id !== account!.account_id
-        || (latest[0]!.account ?? latest[0]!.order.account)?.broker_id !== account!.broker_id) refuse('對帳期間委託或帳戶已變更，請重新確認；未送出改刪單');
-    if (current.length !== 1 || !agreesWithKnownIdentifiers(current[0]!, trade)
-        || !agreesWithKnownIdentifiers(current[0]!, latest[0]!) || !sameAmounts(current[0]!) || remainingWorkingOrderQuantity(current[0]!) <= 0
-        || current[0]!.order.action !== trade.order.action
-        || !current[0]!.order.seqno?.trim() || !current[0]!.order.ordno?.trim()
-        || (current[0]!.contract.target_code || current[0]!.contract.code) !== (trade.contract.target_code || trade.contract.code)) {
-        refuse('期貨對帳未找到可操作且識別完整的同筆委託，未送出改刪單');
-    }
-    return base;
+    if (!found) refuse('伺服器重新對帳後找不到可操作的同筆委託，未送出改刪單');
+    return { base, tradeId: found!.order.id, trade, account: account!, tradingState };
 }
 
+/** Resolves only with a read-back-confirmed cancellation (#120/#116): the
+ *  order's own account row is Cancelled and cancel_quantity covers what was
+ *  remaining. Otherwise rejects with CANCEL_UNCONFIRMED (mutationOutcomeUnknown)
+ *  — the cancel was sent, its effect is unknown, and it is never resent. */
 export function cancelOrder(
     tradeId: string,
-    opts?: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean },
+    opts?: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean; batch?: CancelBatchMember },
+) {
+    const { batch, ...requestOpts } = opts ?? {};
+    // A batch member that fails before verification still arrives, so the
+    // batch's shared confirmation read is not held back.
+    return observeCancel(tradeId, requestOpts, batch).finally(() => batch?.arrive());
+}
+
+/** Cancel several orders: every request is sent first, then each account's
+ *  cancels share one authoritative confirmation read (refresh:true) instead of
+ *  one per order. Used by every batch path (flash 全刪, 鋪單全撤, 全部刪單,
+ *  batch cancel). Single cancels use cancelOrder. */
+export function cancelOrders(tradeIds: string[], onSettled?: () => void): Promise<PromiseSettledResult<Trade>[]> {
+    const batch = createCancelBatch(tradeIds.length);
+    return Promise.allSettled(tradeIds.map(id => cancelOrder(id, { batch: batch.member() }).finally(() => onSettled?.())));
+}
+
+function observeCancel(
+    tradeId: string,
+    opts: { agentInitiated?: boolean; agentCallId?: string; agentAuto?: boolean },
+    batch: CancelBatchMember | undefined,
 ) {
     return observeTradeMutation(tradeId, async () => {
-        const base = await prepareOrderMutation(tradeId);
-        if (base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
-        return apiPost<Trade>(
-        '/api/v1/order/cancel_order',
-        { trade_id: tradeId },
-        opts,
-    ); });
+        const target = await prepareOrderMutation(tradeId);
+        const { account } = target;
+        const { cancelCacheTrusted, locallyCancelled } = target.tradingState;
+        if (target.base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
+        await apiPost<Trade>(
+            '/api/v1/order/cancel_order',
+            { trade_id: target.tradeId },
+            opts,
+        );
+        // Quantities come from the local order at the start; the id is the one
+        // the current sidecar knows (re-resolved when there was no baseline).
+        const before: Trade = { ...target.trade, order: { ...target.trade.order, id: target.tradeId } };
+        const type = account.account_type as 'S' | 'F';
+        const { trade } = await verifyCancellation(before, account, {
+            scope: target.base,
+            // A re-resolved trade_id means no continuous baseline: skip the cache.
+            cacheTrusted: () => target.tradeId === tradeId && cancelCacheTrusted(),
+            locallyCancelled: () => locallyCancelled(tradeId, account),
+            guard: () => {
+                if (target.base !== getApiBase()) throw new Error('刪單後伺服器已切換');
+                if (!getAccountState().accounts.some(a => a.signed && a.account_type === type
+                    && a.broker_id === account.broker_id && a.account_id === account.account_id)) {
+                    throw new Error('刪單後委託帳戶已不可用');
+                }
+            },
+            readTrades: refresh => fetchTrades(type, account, { refresh }),
+            readHealth: () => fetchTradeCacheHealth(type, account),
+            batch,
+        });
+        // A trade_id re-resolved after a sidecar restart is the same order the
+        // caller named; report it under the caller's id so the App's row and
+        // the Agent's order_id match. Status and quantities are the broker's.
+        const confirmed = target.tradeId === tradeId ? trade : { ...trade, order: { ...trade.order, id: tradeId } };
+        return markConfirmedCancellation({ ...confirmed, account });
+    });
 }
 
 export function updateOrderPrice(tradeId: string, price: number) {
     return observeTradeMutation(tradeId, async () => {
-        const base = await prepareOrderMutation(tradeId);
-        if (base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
+        const target = await prepareOrderMutation(tradeId);
+        if (target.base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
+        // 零股委託只能減量（#204）— 任何改價路徑都在送出前擋下
+        if (isOddLot(target.trade.order.order_lot)) throw Object.assign(new Error(ODD_LOT_NO_PRICE_UPDATE), { mutationNotStarted: true });
+        noteMutationIntent(tradeId, { kind: 'price', price });
         return apiPost<Trade>('/api/v1/order/update_price', {
-        trade_id: tradeId,
+        trade_id: target.tradeId,
         price,
     }); });
 }
 
 export function updateOrderQty(tradeId: string, quantity: number) {
     return observeTradeMutation(tradeId, async () => {
-        const base = await prepareOrderMutation(tradeId);
-        if (base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
+        const target = await prepareOrderMutation(tradeId);
+        if (target.base !== getApiBase()) throw Object.assign(new Error('伺服器已切換，未送出改刪單'), { mutationNotStarted: true });
+        noteMutationIntent(tradeId, { kind: 'qty', quantity });
         return apiPost<Trade>('/api/v1/order/update_qty', {
-        trade_id: tradeId,
+        trade_id: target.tradeId,
         quantity,
     }); });
 }
@@ -895,12 +980,37 @@ function accountBody(accountType: AccountTypeName, account?: AccountSelector) {
     };
 }
 
+export interface FetchTradesOptions {
+    /** Shioaji 1.7.6+. `false` reads only this sidecar's process-local Trade
+     *  cache (no upstream call, no accounting quota); `true` runs
+     *  update_status(account) — the authoritative reconciliation. Omitted keeps
+     *  the server default (`true`). Cache rows are not a reconciliation. */
+    refresh?: boolean;
+}
+
 export function fetchTrades(
     accountType: AccountTypeName,
     account?: AccountSelector,
+    options?: FetchTradesOptions,
 ) {
     return apiPost<Trade[]>(
         '/api/v1/order/trades',
+        {
+            ...accountBody(accountType, account),
+            ...(options?.refresh === undefined ? {} : { refresh: options.refresh }),
+        },
+    );
+}
+
+/** Shioaji 1.7.6+: health of the sidecar's process-local Trade cache for one
+ *  account. Cache-only (no broker call); still an HTTP request, so callers
+ *  must trigger it from events (reconnect, detected gap, manual), not timers. */
+export function fetchTradeCacheHealth(
+    accountType: 'S' | 'F',
+    account?: AccountSelector,
+) {
+    return apiPost<TradeCacheHealth>(
+        '/api/v1/order/trade_cache_health',
         accountBody(accountType, account),
     );
 }
@@ -1297,8 +1407,10 @@ export interface ComboTrade {
 export function placeComboOrder(
     combo: { legs: ManagedComboLegReq[]; combo_type?: ComboType | null },
     order: ComboOrderReq,
+    // explicit account captured by the caller; omitted = current selection
+    account?: Account,
 ) {
-    const acc = accountFor('F');
+    const acc = account ?? accountFor('F');
     return apiPost<ComboTrade>('/api/v1/order/place_comboorder', {
         combo_contract: {
             legs: combo.legs,

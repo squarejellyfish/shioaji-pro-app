@@ -26,6 +26,7 @@ import { useQuote } from '../hooks/use-stream';
 import { ensureContract } from '../lib/contracts-cache';
 import { colorWithOpacity } from '../lib/indicator-defs';
 import {
+    CLOSE_GRACE,
     sessionMinutes,
     sessionWindowFor,
     tickBucket,
@@ -36,7 +37,7 @@ import {
     fetchWatchlists,
     type ServerWatchlist
 } from '../lib/shioaji';
-import { getChartColors, useThemeSettings } from '../lib/theme-store';
+import { getChartColors, useThemeSettings, themeKey as themeKeyOf, baseMode } from '../lib/theme-store';
 import type { ContractInfo } from '../lib/types/contract';
 import type { KBars, Snapshot } from '../lib/types/market';
 import { fmtPrice } from '../lib/utils/format';
@@ -52,10 +53,8 @@ import {
 } from './intraday-chart';
 import * as chartUi from './intraday-chart.css';
 import * as styles from './intraday-wall.css';
-import { Orb } from './orb';
+import { AsyncStatus } from './async-status';
 import * as panel from './panel.css';
-
-const CLOSE_GRACE = 240;
 
 // 自訂排列上限：欄 10 × 列 5 = 50 格（訂閱額度與渲染負載的合理天花板）
 const WALL_DIM_MIN = 1;
@@ -239,10 +238,10 @@ function MiniIntraday({
     const quote = useQuote(contract.code);
     const themeSettings = useThemeSettings();
     const colors = getChartColors(themeSettings);
-    const themeKey = `${themeSettings.mode}-${themeSettings.convention}`;
+    const themeKey = themeKeyOf(themeSettings);
     const dispKey = dispKeyOf(disp);
     const isIndex = contract.security_type === 'IND';
-    const avgColor = themeSettings.mode === 'light' ? '#b97f14' : '#e0a43c';
+    const avgColor = baseMode(themeSettings) === 'light' ? '#b97f14' : '#e0a43c';
     const showVol = disp.vol && !isIndex;
     // lightweight-charts 型別標整數，但 renderer 直通 canvas lineWidth，
     // 小數實測有效（與單圖同款 0.5 髮絲線）
@@ -441,11 +440,22 @@ function MiniIntraday({
         setLoading(true);
         setEmpty(false);
         let cancelled = false;
+        // 價格/美國線/均價/量能資料清空（filler 時段軸另外處理）
+        const clearSeries = () => {
+            priceRef.current?.setData([]);
+            barsRef2.current?.setData([]);
+            avgRef.current?.setData([]);
+            volRef.current?.setData([]);
+        };
         // 歷史拿不到時開好空的時段框架（參考價/停板/時段軸來自
         // contract 與現在時間）並讓 loadedRef 成立 — live tick 立刻
         // 作畫，歷史可手動更新
         const scaffoldEmptyFrame = () => {
             if (!priceRef.current || !fillerRef.current) return;
+            // 空框架＝沒有這段的歷史（零 kbars/載入失敗/403）— 先清掉
+            // 圖上殘留的前一次資料（換時段自動重載時是上一段走勢）；
+            // live 累計狀態已歸零，從現在開始重畫
+            clearSeries();
             const ref = Number(contract.reference);
             if (!Number.isFinite(ref) || ref <= 0) return;
             const pend =
@@ -774,12 +784,12 @@ function MiniIntraday({
             <div ref={hostRef} style={{ position: 'absolute', inset: 0 }} />
             {loading && (
                 <div className={styles.centerMsg} style={{ position: 'absolute', inset: 0 }}>
-                    <Orb size={10} />
+                    <AsyncStatus phase='loading' size={10} text='載入走勢…' />
                 </div>
             )}
             {empty && !loading && (
                 <div className={styles.centerMsg} style={{ position: 'absolute', inset: 0 }}>
-                    <span className={panel.mono}>無資料</span>
+                    <AsyncStatus phase='empty' text='無資料' className={panel.mono} />
                 </div>
             )}
         </div>
@@ -1052,8 +1062,7 @@ export function IntradayWallPanel({
         return (
             <div className={styles.wrap}>
                 <div className={styles.centerMsg}>
-                    <Orb size={12} />
-                    <span className={panel.mono}>載入自選清單…</span>
+                    <AsyncStatus phase='loading' text='載入自選清單…' className={panel.mono} />
                 </div>
             </div>
         );

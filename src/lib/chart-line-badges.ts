@@ -46,6 +46,7 @@ export interface BadgeOrder {
     action: 'Buy' | 'Sell';
     price: number;
     quantity: number;
+    draggable?: boolean; // 零股委託不能改價（#204）
 }
 
 export interface BadgeTrigger {
@@ -54,6 +55,8 @@ export interface BadgeTrigger {
     action: 'Buy' | 'Sell';
     price: number;
     quantity: number;
+    orderLot?: string; // IntradayOdd → 數量是股
+    bracketId?: string; // 括號單保護由下單面板管，圖上不能拖
 }
 
 export interface BadgePosition {
@@ -98,7 +101,7 @@ export function buildBadgeSpecs(
             price: o.price,
             color: o.action === 'Buy' ? colors.up : colors.down,
             text: `委${o.action === 'Buy' ? '買' : '賣'}${o.quantity}`,
-            draggable: true,
+            draggable: o.draggable ?? true,
             cancellable: true,
         });
     }
@@ -110,8 +113,8 @@ export function buildBadgeSpecs(
             text:
                 t.kind === 'alert'
                     ? '警示'
-                    : `${t.kind === 'stop' ? '停損' : '停利'}${t.action === 'Buy' ? '買' : '賣'}${t.quantity}`,
-            draggable: true,
+                    : `${t.kind === 'stop' ? '停損' : '停利'}${t.action === 'Buy' ? '買' : '賣'}${t.quantity}${t.orderLot === 'IntradayOdd' ? '股' : ''}`,
+            draggable: !t.bracketId,
             cancellable: true,
         });
     }

@@ -15,10 +15,19 @@ export const header = style({
 
 export const logoBlock = style({
     display: 'flex',
-    alignItems: 'baseline',
+    alignItems: 'center',
     gap: vars.space.sm,
     // 窄視窗時 flex 壓縮會讓副標逐字折行、header 長成兩列
     whiteSpace: 'nowrap',
+});
+
+export const logoMark = style({
+    display: 'inline-block',
+    width: '20px',
+    height: '20px',
+    flexShrink: 0,
+    backgroundColor: vars.color.foreground,
+    mask: 'url(/shioaji-mark-small.svg) center / contain no-repeat',
 });
 
 export const logoMain = style({
@@ -97,6 +106,14 @@ export const led = styleVariants({
         ledBase,
         {
             background: vars.color.up,
+            animation: `${blink} 0.6s infinite`,
+        },
+    ],
+    // open connection but no heartbeat: reconnecting, reports may be missed
+    stale: [
+        ledBase,
+        {
+            background: vars.color.amber,
             animation: `${blink} 0.6s infinite`,
         },
     ],

@@ -10,6 +10,7 @@ import GridLayout, {
 import 'react-grid-layout/css/styles.css';
 import * as styles from './App.css';
 import { BottomDock } from './components/bottom-dock';
+import { AsyncStatus, type AsyncPhase } from './components/async-status';
 import { CandleChart } from './components/candle-chart';
 import { ChipsCard } from './components/chips-card';
 import { ComboListPanel } from './components/combo-list';
@@ -19,6 +20,7 @@ import { DebugPanel } from './components/debug-panel';
 import { DepthLadder } from './components/depth-ladder';
 import { DepthMap } from './components/depth-map';
 import { EventToasts } from './components/event-toasts';
+import { PendingTriggers } from './components/pending-triggers';
 import { FeatureGate } from './components/feature-gate';
 import { FlashOrder } from './components/flash-order';
 import { GridTicket } from './components/grid-ticket';
@@ -32,8 +34,8 @@ import {
 import { NoticeCenter } from './components/notice-center';
 import { OptPayoff } from './components/opt-payoff';
 import { OptionChain } from './components/option-chain';
-import { Orb } from './components/orb';
 import { OrderConfirmHost } from './components/order-confirm-dialog';
+import { primeOrderConfirmSimulation } from './lib/order-confirm';
 import { OrderTicket } from './components/order-ticket';
 import { PanelChrome } from './components/panel-chrome';
 import { PanelErrorBoundary } from './components/panel-error-boundary';
@@ -54,8 +56,10 @@ import { Watchlist } from './components/watchlist';
 import * as grid from './grid.css';
 import { useHotkeys } from './hooks/use-hotkeys';
 import { useWatchlist } from './hooks/use-watchlist';
+import { markWorkspaceVisible } from './lib/frontend-ready';
 import { trackActivity } from './lib/activity';
 import { registerAgentAppCommandHost } from './lib/agent-app-command';
+import { requestedBacktestPanelId, selectBacktestPanelId } from './lib/backtest-link-routing';
 import {
     isAgentHarnessEnabled,
     subscribeAgentHarnessEnabled,
@@ -81,6 +85,8 @@ import {
 import { isTauri, openPopout } from './lib/tauri';
 import { notify } from './lib/trade';
 import { tradingActionObserved, useTradingState } from './lib/trading-state';
+import { ensureStream } from './lib/stream';
+import { ensureAccounts } from './lib/account-store';
 import type { ContractInfo } from './lib/types/contract';
 import {
     BLOCK_META,
@@ -93,14 +99,28 @@ import {
     newBlockId,
     saveProfiles,
     saveWorkspace,
+    popoutSessionFromQuery,
+    popoutSessionParam,
     toRenderGeom,
+    withBlockSessionConfig,
+    type SessionConfigPatch,
     type Block,
     type BlockType,
     type Profile,
     type PulseSection,
     type PulseSectionWeights,
     type Workspace,
+    withBlockPatch,
 } from './lib/workspace';
+import { mainFlashSelection } from './lib/order-account';
+import {
+    flashPopoutParams,
+    reseedPopoutFlashAccounts,
+    loadPopoutFlashAccounts,
+    savePopoutFlashAccounts,
+    touchPopoutFlashAccounts,
+    type FlashAccountKeys,
+} from './lib/flash-account';
 
 const POPOUT_TYPES: ReadonlySet<string> = new Set([
     'chart',
@@ -120,40 +140,57 @@ const POPOUT_TYPES: ReadonlySet<string> = new Set([
 const popoutQuery = new URLSearchParams(window.location.search);
 const POPOUT_TYPE = popoutQuery.get('popout');
 const POPOUT_CODE = popoutQuery.get('code') || null;
+// 彈出視窗繼承面板的時段選擇（只當初始值，之後各自獨立）
+const popoutSession = popoutSessionFromQuery(popoutQuery);
+const popoutChartSession = popoutSession.chartSession;
+const popoutIntradaySession = popoutSession.intradaySession;
 
 // resolves a block's contract: pinned code (contract cache) or global selection
 function useBlockContract(
     block: Block,
     selected: ContractInfo | null,
-): ContractInfo | null {
+): { contract: ContractInfo | null; pinFailed: boolean } {
     const pinned = useContract(block.pin);
+    const [failedPin, setFailedPin] = useState<string | null>(null);
     useEffect(() => {
         if (block.pin && !pinned) {
-            ensureContract(block.pin).catch(() =>
+            let active = true;
+            setFailedPin(null);
+            ensureContract(block.pin).catch(() => {
+                if (!active) return;
+                setFailedPin(block.pin);
                 notify({
                     kind: 'err',
                     title: '找不到商品',
                     body: `代碼 ${block.pin} 無法解析`,
-                }),
-            );
+                });
+            });
+            return () => { active = false; };
         }
     }, [block.pin, pinned]);
-    return block.pin ? (pinned ?? null) : selected;
+    return {
+        contract: block.pin ? (pinned ?? null) : selected,
+        pinFailed: !!block.pin && !pinned && failedPin === block.pin,
+    };
 }
 
 function BlockBody({
     block,
     contract,
+    missingContractPhase,
     snapshot,
     watchlistProps,
     dockProps,
     onSelectCode,
     onPulseConfigChange,
     onWallConfigChange,
+    onFlashAccountsChange,
+    onSessionConfigChange,
     refreshTrading,
 }: {
     block: Block;
     contract: ContractInfo | null;
+    missingContractPhase: AsyncPhase;
     snapshot?: import('./lib/types/market').Snapshot;
     watchlistProps: React.ComponentProps<typeof Watchlist>;
     dockProps: React.ComponentProps<typeof BottomDock>;
@@ -169,6 +206,8 @@ function BlockBody({
         cols: number,
         rows: number,
     ) => void;
+    onFlashAccountsChange: (id: string, keys: FlashAccountKeys) => void;
+    onSessionConfigChange: (id: string, patch: SessionConfigPatch) => void;
     refreshTrading: () => void;
 }) {
     if (contract?.security_type === 'IND' && indexBlockMessage(block.type)) {
@@ -197,16 +236,30 @@ function BlockBody({
                         contract={contract}
                         trades={dockProps.trades}
                         onOrdersChanged={dockProps.onTradesChanged}
+                        sessionMode={block.chartSession}
+                        onSessionModeChange={(chartSession) =>
+                            onSessionConfigChange(block.id, { chartSession })
+                        }
+                        orderSettings={block.chartOrder}
+                        onOrderSettingsChange={(chartOrder) =>
+                            onSessionConfigChange(block.id, { chartOrder })
+                        }
                     />
                 </>
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'intraday':
             return contract ? (
-                <IntradayChart contract={contract} />
+                <IntradayChart
+                    contract={contract}
+                    sessionMode={block.intradaySession}
+                    onSessionModeChange={(intradaySession) =>
+                        onSessionConfigChange(block.id, { intradaySession })
+                    }
+                />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'intradaywall':
             return (
@@ -224,31 +277,33 @@ function BlockBody({
             return contract ? (
                 <DepthLadder contract={contract} code={contract.code} snapshot={snapshot} />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'ticket':
             return contract ? (
                 <OrderTicket contract={contract} onPlaced={refreshTrading} />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'tape':
             return contract ? (
                 <TickTape contract={contract} />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'flash':
             return contract ? (
-                <FlashOrder
+                <LiveFlashOrder
                     snapshot={snapshot}
                     contract={contract}
                     trades={dockProps.trades}
                     positions={dockProps.positions}
                     onOrdersChanged={dockProps.onTradesChanged}
+                    accountKeys={block.flashAccounts}
+                    onAccountKeysChange={(keys) => onFlashAccountsChange(block.id, keys)}
                 />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'pnl':
             return <PnlPanel />;
@@ -256,13 +311,13 @@ function BlockBody({
             return contract ? (
                 <ChipsCard contract={contract} />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'volprofile':
             return contract ? (
                 <VolProfile contract={contract} />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'optchain':
             return <OptionChain onPick={onSelectCode} />;
@@ -306,12 +361,13 @@ function BlockBody({
         case 'grid':
             return contract ? (
                 <GridTicket
+                    panelId={block.id}
                     contract={contract}
                     trades={dockProps.trades}
                     onOrdersChanged={dockProps.onTradesChanged}
                 />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'heatmap':
             return <SectorHeatmap onPick={onSelectCode} />;
@@ -337,7 +393,7 @@ function BlockBody({
             return (
                 <FeatureGate feature='backtest'>
                     {BtPanel ? (
-                        <BtPanel contract={contract} onPick={onSelectCode} />
+                        <BtPanel contract={contract} onPick={onSelectCode} panelId={block.id} />
                     ) : null}
                 </FeatureGate>
             );
@@ -356,19 +412,36 @@ function BlockBody({
             return contract ? (
                 <ReplayPanel contract={contract} />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
         case 'depthmap':
             return contract ? (
                 <DepthMap contract={contract} snapshot={snapshot} />
             ) : (
-                <BlockPlaceholder />
+                <BlockPlaceholder phase={missingContractPhase} />
             );
     }
 }
 
-function BlockPlaceholder() {
-    return <div className={styles.blockPlaceholder}>等待商品…</div>;
+// 閃電下單的 FIFO 成本需要今日成交完整：委託或持倉待對帳時改顯示估算
+function LiveFlashOrder(props: Omit<React.ComponentProps<typeof FlashOrder>, 'reconcilePending'>) {
+    const { queries } = useTradingState();
+    return (
+        <FlashOrder
+            {...props}
+            reconcilePending={queries.orders.needsReconcile || queries.positions.needsReconcile}
+        />
+    );
+}
+
+function BlockPlaceholder({ phase = 'idle' }: { phase?: AsyncPhase }) {
+    return <div className={styles.blockPlaceholder}>
+        <AsyncStatus
+            phase={phase}
+            size={14}
+            text={phase === 'loading' ? '載入商品…' : phase === 'error' ? '商品讀取失敗' : '等待商品…'}
+        />
+    </div>;
 }
 
 function indexBlockMessage(type: BlockType): string | null {
@@ -421,15 +494,20 @@ interface BlockViewProps {
         cols: number,
         rows: number,
     ) => void;
+    onFlashAccountsChange: (id: string, keys: FlashAccountKeys) => void;
+    onSessionConfigChange: (id: string, patch: SessionConfigPatch) => void;
     refreshTrading: () => void;
 }
 
 function BlockView(props: BlockViewProps) {
     const { block, selected, onPinChange, onRemove, ...bodyProps } = props;
-    const contract = useBlockContract(block, selected);
+    const { contract, pinFailed } = useBlockContract(block, selected);
+    const missingContractPhase: AsyncPhase = block.pin
+        ? pinFailed ? 'error' : 'loading'
+        : bodyProps.watchlistProps.loading && bodyProps.watchlistProps.items.length === 0
+            ? 'loading' : 'idle';
     const meta = BLOCK_META[block.type];
-    const showSymbol =
-        meta.pinnable && contract ? ` · ${contract.code}` : '';
+    const symbol = meta.pinnable && contract ? contract : null;
     const pulseMarket =
         block.type === 'pulse' && block.pulseIndex
             ? ` · ${block.pulseIndex === 'IX0001' ? '上市' : '上櫃'}`
@@ -438,7 +516,10 @@ function BlockView(props: BlockViewProps) {
     return (
         <section className={panel.panel}>
             <PanelChrome
-                title={`${meta.label}${pulseMarket}${showSymbol}`}
+                title={`${meta.label}${pulseMarket}`}
+                symbolCode={symbol?.code}
+                // 閃電下單的商品名稱改在面板內的名稱列顯示（#176）
+                symbolName={block.type === 'flash' ? undefined : symbol?.name}
                 pinnable={meta.pinnable}
                 pin={block.pin}
                 currentCode={selected?.code ?? null}
@@ -446,20 +527,35 @@ function BlockView(props: BlockViewProps) {
                 onRemove={() => onRemove(block.id)}
                 onPopout={
                     POPOUT_TYPES.has(block.type)
-                        ? () =>
+                        ? () => {
+                              const global = mainFlashSelection();
+                              const flashParams = block.type === 'flash'
+                                  ? flashPopoutParams(block.flashAccounts, global, `panel:${block.id}:${contract?.code ?? ''}`)
+                                  : undefined;
                               void openPopout(
                                   block.type,
                                   contract?.code ?? null,
-                              )
+                                  // popout 開啟時固定帳戶：面板自己的選擇，跟隨主畫面的市場
+                                  // 則取此刻主畫面的選擇（popout 不會即時跟隨）
+                                  {
+                                      ...popoutSessionParam(block),
+                                      ...flashParams,
+                                  },
+                                  flashParams ? () => reseedPopoutFlashAccounts(flashParams.win, block.flashAccounts, global) : undefined,
+                              );
+                          }
                         : undefined
                 }
             />
             <PanelErrorBoundary label={meta.label}>
-                <BlockBody {...bodyProps} block={block} contract={contract} />
+                <BlockBody {...bodyProps} block={block} contract={contract} missingContractPhase={missingContractPhase} />
             </PanelErrorBoundary>
         </section>
     );
 }
+
+// 閃電下單 popout 的視窗 id（issue #139）— 帳戶選擇依此存在本機，URL 不帶帳號
+const POPOUT_WINDOW_ID = popoutQuery.get('win') || null;
 
 function PopoutView({
     type,
@@ -468,13 +564,31 @@ function PopoutView({
     type: BlockType;
     code: string | null;
 }) {
+    // Some panels (notably the tick tape) subscribe to raw events without
+    // useQuote; every popout must join the shared stream on its own.
+    useEffect(ensureStream, []);
     const contract = useContract(code);
     useEffect(() => {
         if (code) ensureContract(code).catch(() => undefined);
     }, [code]);
     const trading = useTradingState();
+    // Tiles have no HUD header to fetch /info before the first confirmation.
+    useEffect(() => {
+        if (type === 'flash') void primeOrderConfirmSimulation();
+    }, [type]);
+    // popouts (incl. 閃電全開 tiles, web and desktop alike) have no dock or
+    // settings dialog to trigger the account fetch — load it here (#139)
+    useEffect(ensureAccounts, []);
     const tradesState = { data: trading.trades, refresh: tradingActionObserved };
     const popoutPositionsState = { data: trading.positions, refresh: tradingActionObserved };
+    // popout 不在 workspace 裡 — 帳戶依視窗 id 存在本機（開啟時由開啟端固定並預先寫入）
+    const [flashAccounts, setFlashAccounts] = useState(() => loadPopoutFlashAccounts(POPOUT_WINDOW_ID));
+    // heartbeat: a long-open popout must not be evicted as "stale"
+    useEffect(() => {
+        if (type !== 'flash' || !POPOUT_WINDOW_ID) return;
+        const t = setInterval(() => touchPopoutFlashAccounts(POPOUT_WINDOW_ID), 10 * 60_000);
+        return () => clearInterval(t);
+    }, [type]);
     const meta = BLOCK_META[type];
 
     let body: React.ReactNode = <BlockPlaceholder />;
@@ -512,12 +626,18 @@ function PopoutView({
                             contract={contract}
                             trades={tradesState.data ?? []}
                             onOrdersChanged={tradesState.refresh}
+                            sessionMode={popoutChartSession}
                         />
                     </>
                 );
                 break;
             case 'intraday':
-                body = <IntradayChart contract={contract} />;
+                body = (
+                    <IntradayChart
+                        contract={contract}
+                        sessionMode={popoutIntradaySession}
+                    />
+                );
                 break;
             case 'depth':
                 body = <DepthLadder contract={contract} code={contract.code} />;
@@ -535,13 +655,19 @@ function PopoutView({
                 break;
             case 'flash':
                 body = (
-                    <FlashOrder
+                    <LiveFlashOrder
                         contract={contract}
                         trades={tradesState.data ?? []}
                         positions={popoutPositionsState.data ?? []}
                         onOrdersChanged={() => {
                             tradesState.refresh();
                             popoutPositionsState.refresh();
+                        }}
+                        accountKeys={flashAccounts}
+                        followMain={false}
+                        onAccountKeysChange={(keys) => {
+                            setFlashAccounts(keys);
+                            savePopoutFlashAccounts(POPOUT_WINDOW_ID, keys);
                         }}
                     />
                 );
@@ -567,9 +693,12 @@ function PopoutView({
         <div className={styles.shell}>
             <EventToasts />
             <OrderConfirmHost />
+            <PendingTriggers compact />
             <section className={panel.panel} style={{ flex: 1, margin: 6 }}>
                 <PanelChrome
-                    title={`${meta.label}${contract ? ` · ${contract.code}` : ''}`}
+                    title={meta.label}
+                    symbolCode={contract?.code}
+                    symbolName={type === 'flash' ? undefined : contract?.name}
                 />
                 <PanelErrorBoundary label={meta.label}>
                     {body}
@@ -591,7 +720,9 @@ function MainApp() {
     const {
         items,
         loading,
-        initialLoading,
+        structureBusy,
+        loadError,
+        retryLoad,
         addSymbol,
         removeSymbol,
         reorderSymbol,
@@ -618,6 +749,10 @@ function MainApp() {
     const itemsRef = useRef(items);
     itemsRef.current = items;
     const { width, containerRef, mounted } = useContainerWidth();
+
+    useEffect(() => {
+        if (mounted) markWorkspaceVisible();
+    }, [mounted]);
 
     useEffect(
         () => subscribeAgentHarnessEnabled(setAgentHarnessEnabledState),
@@ -884,6 +1019,7 @@ function MainApp() {
                 blocks: [...workspace.blocks, { id, type, pin: null }],
                 layout: [...workspace.layout, item],
             });
+            return id;
         },
         [workspace, updateWorkspace],
     );
@@ -906,6 +1042,49 @@ function MainApp() {
                 1300,
             );
         });
+    }, []);
+
+    // Persistent research links are owned by the backtest panel. The App
+    // only ensures that the panel exists and is visible on load or navigation.
+    const addBacktestRef = useRef(addBlock);
+    addBacktestRef.current = addBlock;
+    const locateBacktestRef = useRef(locateBlock);
+    locateBacktestRef.current = locateBlock;
+    const initialBacktestLinkRef = useRef({
+        runId: new URLSearchParams(window.location.search).get('backtest_run'),
+        panelId: new URLSearchParams(window.location.search).get('backtest_panel'),
+    });
+    useEffect(() => {
+        const openLinkedRun = (event?: Event) => {
+            const runId = new URLSearchParams(window.location.search).get('backtest_run');
+            if (!runId) return;
+            const requested = requestedBacktestPanelId(
+                (event as CustomEvent<{ panelId?: string }> | undefined)?.detail?.panelId,
+                new URLSearchParams(window.location.search).get('backtest_panel'),
+                initialBacktestLinkRef.current.runId === runId
+                    ? initialBacktestLinkRef.current.panelId : null,
+            );
+            const blocks = workspaceRef.current.blocks;
+            const existingId = selectBacktestPanelId(blocks, requested);
+            const panelId = existingId ?? addBacktestRef.current('backtest');
+            if (!panelId) return;
+            if (existingId) locateBacktestRef.current(panelId);
+            // Keep the target in the URL until a newly added panel mounts. The
+            // selected panel removes this routing parameter after opening.
+            const url = new URL(window.location.href);
+            url.searchParams.set('backtest_panel', panelId);
+            history.replaceState(history.state, '', url);
+            window.dispatchEvent(new CustomEvent('shioaji:target-backtest-run', {
+                detail: { runId, panelId },
+            }));
+        };
+        window.addEventListener('shioaji:open-backtest-run', openLinkedRun);
+        window.addEventListener('popstate', openLinkedRun);
+        openLinkedRun();
+        return () => {
+            window.removeEventListener('shioaji:open-backtest-run', openLinkedRun);
+            window.removeEventListener('popstate', openLinkedRun);
+        };
     }, []);
 
     const removeBlock = useCallback(
@@ -942,6 +1121,25 @@ function MainApp() {
                         : block,
                 ),
             });
+        },
+        [workspace, updateWorkspace],
+    );
+
+    // generic per-block field update (persisted with the workspace)
+    const patchBlock = useCallback(
+        (id: string, patch: Partial<Block>) => {
+            updateWorkspace(withBlockPatch(workspace, id, patch));
+        },
+        [workspace, updateWorkspace],
+    );
+    const setBlockFlashAccounts = useCallback(
+        (id: string, flashAccounts: FlashAccountKeys) =>
+            patchBlock(id, { flashAccounts }),
+        [patchBlock],
+    );
+    const setBlockSessionConfig = useCallback(
+        (id: string, patch: SessionConfigPatch) => {
+            updateWorkspace(withBlockSessionConfig(workspace, id, patch));
         },
         [workspace, updateWorkspace],
     );
@@ -1106,9 +1304,6 @@ function MainApp() {
         [items],
     );
 
-    const booting = initialLoading;
-
-
     const watchlistProps = {
         items,
         selectedCode: selected?.code ?? null,
@@ -1123,6 +1318,9 @@ function MainApp() {
         onRenameList: renameCurrentList,
         onDeleteList: deleteCurrentList,
         loading,
+        structureBusy,
+        loadError,
+        onRetryLoad: retryLoad,
     };
     const dockProps = {
         positions: positionsState.data ?? [],
@@ -1153,6 +1351,7 @@ function MainApp() {
             />
 <EventToasts />
             <OrderConfirmHost />
+            <PendingTriggers />
             <CommandPalette
                 open={paletteOpen}
                 onClose={() => setPaletteOpen(false)}
@@ -1169,16 +1368,7 @@ function MainApp() {
             />
 
             <div className={grid.gridWrap} ref={containerRef}>
-                {booting && (
-                    <div className={styles.loading}>
-                        <Orb size={20} />
-                        <span>Shioaji Pro</span>
-                        <span style={{ fontSize: '0.7rem' }}>
-                            載入交易終端…
-                        </span>
-                    </div>
-                )}
-                {!booting && mounted && (
+                {mounted && (
                     <GridLayout
                         layout={renderLayout}
                         width={width}
@@ -1215,6 +1405,8 @@ function MainApp() {
                                     onSelectCode={selectByCode}
                                     onPulseConfigChange={setBlockPulseConfig}
                                     onWallConfigChange={setBlockWallConfig}
+                                    onFlashAccountsChange={setBlockFlashAccounts}
+                                    onSessionConfigChange={setBlockSessionConfig}
                                     refreshTrading={refreshTrading}
                                 />
                             </div>

@@ -1,6 +1,8 @@
 # Agent Harness threat model
 
-This candidate enables production semantic Agent trading with Shioaji 1.7.5.
+This candidate enables production semantic Agent trading with Shioaji 1.7.5 and
+later; the one-shot IPC bootstrap and capability v1 were re-checked against a
+1.7.6 simulation sidecar on 2026-09-23 (`bootstrap=one_shot_ipc`).
 The maintainer explicitly requested user-selected production Auto, superseding
 #51's original mandatory-confirm-only product constraint. The wire capability
 contract remains v1. See [AGENT_HARNESS_CONTRACT.md](AGENT_HARNESS_CONTRACT.md).
@@ -42,9 +44,14 @@ A provider and its descendants share their own short-lived MCP bearer scope.
    remain blocked. Direct HTTP callers cannot mint a sidecar capability.
 7. MCP binds to IPv4 loopback, rejects non-loopback Origins, limits request and
    pending-call sizes, validates registered schemas, and revokes bearer digests
-   with runtimes. Native event redaction removes exact credentials before logs
-   or WebView emission. Bearers may reside in owner-only provider configuration
-   or argv and are not secret from that provider's own descendants.
+   with runtimes. Native redaction removes exact credentials from events,
+   pending requests and RPC results before logs or WebView delivery; runtime
+   events go only to the main window, never to popout, tray or approval
+   windows. Bearers never appear in argv or an inherited environment; they
+   reside in owner-only provider configuration files that are deleted on
+   runtime stop/exit and swept after a crash, are accepted only from the
+   runtime's own process tree, and are not secret from the same OS user or
+   that provider's own descendants.
 8. Audit records include proposal/denial, scope digests, capability consumption,
    response class and unknown outcome. They contain no body or credentials.
    Keyed entries and a MACed head checkpoint detect edits, missing segments,

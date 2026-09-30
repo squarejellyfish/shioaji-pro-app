@@ -11,13 +11,22 @@ import {
     selectAccount,
     useAccounts,
 } from '../lib/account-store';
+import { UNSIGNED_LABEL, UNSIGNED_TITLE } from '../lib/account-signing';
 import {
     maskAccountId,
     maskMoney,
     usePrivacyMode,
     usePrivacyMoney,
 } from '../lib/privacy';
-import { refreshTradingState, useTradingState } from '../lib/trading-state';
+import { RECONCILE_REASON_LABELS, refreshTradingState, useTradingState, type ReconcileReason } from '../lib/trading-state';
+import { queryDisplayState } from '../lib/query-display-state';
+
+// 待對帳 names its distinct causes (#85); the tooltip keeps the full messages.
+function reconcileLabel(reasons: readonly ReconcileReason[] | undefined) {
+    const labels = (reasons ?? []).map(r => RECONCILE_REASON_LABELS[r]).filter(Boolean);
+    if (!labels.length) return '待對帳';
+    return `待對帳：${labels.slice(0, 2).join('、')}${labels.length > 2 ? ` 等 ${labels.length} 項` : ''}`;
+}
 import type { Trade } from '../lib/types/order';
 import type {
     AccountBalance,
@@ -65,6 +74,10 @@ export function BottomDock({
     const [tab, setTab] = useState<TabKey>('positions');
     const [accountRefresh, setAccountRefresh] = useState<AccountRefreshControls | null>(null);
     const queryStatus = portfolio.queries[tab];
+    const positionsQuery = portfolio.queries.positions;
+    const positionsStatus = queryDisplayState(positionsQuery);
+    const ordersQuery = portfolio.queries.orders;
+    const ordersStatus = queryDisplayState(ordersQuery);
     // 操作通知已呈現改刪單結果；不在委託表重複常駐通用提示。
     const queryError = tab === 'orders'
         && queryStatus.error === '刪單／改單結果待確認；請手動更新委託，不要自動重送'
@@ -125,10 +138,10 @@ export function BottomDock({
     ).length;
 
     const tabs: { key: TabKey; label: string }[] = [
-        { key: 'positions', label: `持倉 Positions [${positions.length}]` },
+        { key: 'positions', label: `持倉 Positions [${positionsStatus === 'ready' ? positions.length : positions.length > 0 ? `${positions.length}+` : '…'}]` },
         {
             key: 'orders',
-            label: `委託 Orders [${activeOrders}/${scopedTrades.length}]`,
+            label: `委託 Orders [${ordersStatus === 'ready' ? `${activeOrders}/${scopedTrades.length}` : trades.length > 0 ? `${activeOrders}/${scopedTrades.length}+` : '…'}]`,
         },
         { key: 'account', label: '帳務/交割 Account' },
     ];
@@ -192,7 +205,7 @@ export function BottomDock({
                     </button>
                 ))}
                 <span style={{ fontSize: 11, whiteSpace: 'nowrap' }} title={queryStatus.error ?? (tab === 'positions' ? '持倉依成交與行情在本機估算' : tab === 'orders' ? '委託依主動回報更新' : '帳務為上次查詢快照')}>
-                    {queryStatus.needsReconcile || (tab === 'account' && accountRefresh?.error) ? '待對帳' : tab === 'positions' ? '即時估算' : tab === 'orders' ? '即時回報' : '帳務快照'}
+                    {queryStatus.needsReconcile || (tab === 'account' && accountRefresh?.error) ? reconcileLabel(queryStatus.reasons) : tab === 'positions' ? '即時估算' : tab === 'orders' ? '即時回報' : '帳務快照'}
                     {queryStatus.updatedAt ? ` · 查詢 ${new Date(queryStatus.updatedAt).toLocaleTimeString()}` : ' · 尚未查詢'}
                 </span>
                 <span className={styles.tabSpacer} />
@@ -231,11 +244,11 @@ export function BottomDock({
                                 key={key}
                                 value={key}
                                 disabled
-                                title='未簽署 API 約定書（無法下單）'
+                                title={UNSIGNED_TITLE}
                             >
                                 {a.account_type === 'S' ? '[證]' : '[期]'}{' '}
                                 {a.broker_id}-
-                                {maskAccountId(a.account_id, priv)} · 未簽署
+                                {maskAccountId(a.account_id, priv)} · {UNSIGNED_LABEL}
                             </option>
                         );
                     })}
@@ -279,8 +292,8 @@ export function BottomDock({
                     <span
                         className={`${styles.sumValue} ${panel.dirText[pnlDir]}`}
                     >
-                        {maskMoney(fmtSigned(totalPnl, 0), privMoney)}
-                        {pnlPct !== null && (
+                        {positionsStatus === 'ready' ? maskMoney(fmtSigned(totalPnl, 0), privMoney) : '—'}
+                        {positionsStatus === 'ready' && pnlPct !== null && (
                             <span className={styles.sumSub}>
                                 {' '}
                                 ({pnlPct > 0 ? '+' : ''}
@@ -293,10 +306,10 @@ export function BottomDock({
                     <span className={styles.sumItem}>
                         <span className={styles.sumLabel}>總市值</span>
                         <span className={styles.sumValue}>
-                            {maskMoney(
+                            {positionsStatus === 'ready' ? maskMoney(
                                 fmtMoney(Math.round(stockValue)),
                                 privMoney,
-                            )}
+                            ) : '—'}
                         </span>
                     </span>
                 )}
@@ -326,6 +339,7 @@ export function BottomDock({
             {tab === 'positions' && (
                 <PositionsPane
                     positions={positions}
+                    initialStatus={positionsStatus}
                     mode={mode}
                     market={market}
                     scopeKey={scope}
@@ -337,6 +351,7 @@ export function BottomDock({
             {tab === 'orders' && (
                 <OrdersPane
                     trades={trades}
+                    initialStatus={ordersStatus}
                     mode={mode}
                     market={market}
                     scopeKey={scope}

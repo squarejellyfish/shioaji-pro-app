@@ -50,11 +50,16 @@ identical to the TypeScript constants consumed by the application.
 
 The desktop host provides one authenticated loopback MCP endpoint. Every native
 runtime receives a distinct short-lived bearer through its native MCP header
-configuration, not an inherited child-process environment variable. Depending
-on the provider's native protocol, that configuration can reside in an
-owner-only temporary file or process argv and may therefore be observable to a
-same-user process. Tokens are never returned to the WebView and are revoked when
-the runtime stops. Tool
+configuration, never through process argv (readable by every local user and
+captured by command-line telemetry) or an inherited child-process environment
+variable. The configuration is an owner-only file in a per-App-instance
+directory that is deleted when the runtime stops or exits and swept at the next
+start after a crash; it remains readable by the same OS user and by the
+provider's own descendants. The endpoint accepts a bearer only from a
+connection owned by that runtime's process tree. Tokens are never returned to
+the WebView: runtime events, pending requests and RPC results are redacted
+before delivery, and runtime events reach only the main window. Tokens are
+revoked when the runtime stops. Tool
 calls use typed JSON arguments and semantic names; coordinate
 automation, raw key capture, and virtual Bash commands are outside this
 contract.
@@ -83,6 +88,30 @@ payload matches cannot authorize a retry. `reconcile_order` therefore separates
 is stable; a later broker-state observation uses a new attempt key and may move
 the original mutation to a terminal reconciled state. Payload-shaped matches
 remain unresolved and require manual verification.
+
+Production per-order confirmation has a deliberate limitation: the last price
+and best bid/ask captured for the proposal must equal the values re-read after
+approval, and the whole round trip — including opening the approval window —
+must finish within the 15-second proposal lifetime. On an actively ticking
+product a human approval often misses that window. The order is then not sent,
+the user sees 「報價已變動，請重新確認」 (or its 15-second variant), and the
+Agent must re-propose at the new quote. The rule is not relaxed to a tolerance
+band, because the user would otherwise authorize a price they never saw. Every
+refusal names its cause — user denied, window closed, expired, quote changed,
+runtime stopped or authority revoked, or risk check — and states that the
+order was not sent.
+
+The approval window renders `cancel_order`, `update_price`, and `update_qty`
+as operations on an existing order (刪單／改價／減量) with the product, the
+original order, and the remaining unfilled quantity. The native summary
+carries an explicit `operation` and `remaining_quantity`; when a legacy summary
+omits them the window derives both from the request operation and the order
+status. It never renders the original order's side as a new buy or sell. The
+outer request operation is authoritative: if the summary declares a different
+`operation`, the window shows only the operation label. The window can already
+render `update_price` and `update_qty`, but production does not accept them
+yet: native proposal validation admits only `place_order` and `cancel_order`
+and rejects every other Agent mutation before an approval is shown.
 
 Controlled auto is available in simulation and in production after the user
 grants the native scope above. It is never restored from persisted settings.

@@ -3,6 +3,7 @@
 import { useEffect, useSyncExternalStore } from 'react';
 import { ensureContract } from '../lib/contracts-cache';
 import { retainContractQuotes } from '../lib/quote-ownership';
+import { getTradingMirrorFresh, subscribeTradingMirror } from '../lib/trading-mirror-lease';
 import type { QuoteState, StreamStatus } from '../lib/stream';
 import {
     ensureStream,
@@ -21,20 +22,28 @@ export function useStreamStatus(): StreamStatus {
 // order buttons on anything else so users never fire into a dead connection
 // or think a click sent an order when it didn't (issue #2)
 export function useTradingLive(): boolean {
-    return useStreamStatus() === 'live';
+    const status = useStreamStatus();
+    const mirrorFresh = useSyncExternalStore(subscribeTradingMirror, getTradingMirrorFresh);
+    return status === 'live' && mirrorFresh;
 }
 
-export function useQuote(code: string | null): QuoteState | undefined {
+export interface UseQuoteOptions {
+    /** 盤中零股行情（intraday_odd）：獨立訂閱與 store，量以股計（#204） */
+    oddLot?: boolean;
+}
+
+export function useQuote(code: string | null, options?: UseQuoteOptions): QuoteState | undefined {
+    const oddLot = options?.oddLot === true;
     useEffect(() => {
         ensureStream();
         let active = true;
         let release: (() => void) | undefined;
-        if (code) void ensureContract(code).then(c => { if (active) release = retainContractQuotes(c); }).catch(() => undefined);
+        if (code) void ensureContract(code).then(c => { if (active) release = retainContractQuotes(c, oddLot ? { oddLot } : undefined); }).catch(() => undefined);
         return () => { active = false; release?.(); };
-    }, [code]);
+    }, [code, oddLot]);
     return useSyncExternalStore(
         (listener) =>
-            code ? subscribeQuoteStore(code, listener) : () => undefined,
-        () => (code ? getQuote(code) : undefined),
+            code ? subscribeQuoteStore(code, listener, oddLot) : () => undefined,
+        () => (code ? getQuote(code, oddLot) : undefined),
     );
 }

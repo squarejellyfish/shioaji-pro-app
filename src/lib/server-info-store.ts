@@ -35,6 +35,16 @@ export function observeServerInfo(request: ServerInfoRequest, info: ServerInfo |
     for (const listener of listeners) listener();
 }
 
+/** Drop what is known for `base` (e.g. the stream went down: the sidecar may
+ * be restarting in another mode on the same port). Responses to requests
+ * started before this are ignored; only a fresh /info repopulates it. */
+export function forgetServerInfo(base: string) {
+    sequence += 1;
+    applied.set(base, sequence);
+    if (!infos.delete(base)) return;
+    for (const listener of listeners) listener();
+}
+
 // Hoisted so useSyncExternalStore keeps one subscription per component instead
 // of re-subscribing on every render.
 export function subscribeServerInfo(listener: () => void) {
@@ -42,16 +52,23 @@ export function subscribeServerInfo(listener: () => void) {
     return () => { listeners.delete(listener); };
 }
 function currentServerInfo() { return infos.get(getApiBase()); }
+/** Last /info observed for the current API base, without a new request. */
+export const knownServerInfo = currentServerInfo;
 
 export function useServerInfo() {
     return useSyncExternalStore(subscribeServerInfo, currentServerInfo);
 }
 
+// Versions whose simulation yd_quantity was verified to follow the position
+// unit. Empty until Sinotrade/Shioaji#233 is fixed and re-verified read-only.
+const YD_QUANTITY_UNIT_FIXED = new Set<string>();
+
 export function yesterdayQuantityNotice(info: Pick<ServerInfo, 'version' | 'simulation'> | undefined): string | undefined {
     if (!info) return '尚未取得伺服器資訊；昨餘單位待確認。';
-    // Verified for simulation 1.7.5 only (app #107, Sinotrade/Shioaji#233).
-    // Recheck Common/Share units against the official position contract on bump.
-    return info.simulation === true && info.version === '1.7.5'
-        ? 'Shioaji 1.7.5 模擬帳務的昨餘單位待確認；保留 API 原值，不推算張／股。'
+    // Sinotrade/Shioaji#233 (app #107): simulation yd_quantity does not follow
+    // the Common/Share unit (read-only reproduced on 1.7.5 and 1.7.6). Warn in
+    // simulation unless the version is known fixed; never assume a bump fixed it.
+    return info.simulation === true && !YD_QUANTITY_UNIT_FIXED.has(info.version)
+        ? `Shioaji ${info.version} 模擬帳務的昨餘單位待確認；保留 API 原值，不推算張／股。`
         : undefined;
 }
