@@ -1,5 +1,16 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+    DEFAULT_LINE_OPACITY,
+    anchorCount,
+    drawingLabel,
+    fibOptionsOf,
+    MAX_TEXT_LENGTH,
+    moveDrawing,
+    removeDrawings,
+    replaceDrawings,
+    setDrawingsLocked,
+    HARD_MAX_DRAWINGS_PER_SYMBOL,
+    takeDrawingNotices,
     writeDrawingJournal,
     __setDrawingLocksForTest,
     TOMBSTONE_TTL_MS,
@@ -29,6 +40,7 @@ import {
     updateDrawing,
     type DrawingAnchor,
 } from './chart-drawings';
+import { defaultFibLevels, defaultFibOptions } from './chart-drawing-fib';
 
 const store = new Map<string, string>();
 
@@ -428,6 +440,131 @@ describe('設定寫入節流', () => {
     });
 });
 
+describe('第一期：新物件類型、舊資料相容、圖層順序', () => {
+    const KEY = 'sj-pro-chart-drawings';
+    const saved = () => JSON.parse(store.get(KEY)!) as Record<string, { id: string }[]>;
+
+    it('#218 存下來的舊物件（沒有 name／text／levels）照常載入', () => {
+        store.set(
+            KEY,
+            JSON.stringify({
+                TXF: [
+                    {
+                        id: 'old',
+                        tool: 'trend',
+                        anchors: [
+                            { time: 1, price: 2 },
+                            { time: 3, price: 4 },
+                        ],
+                        style: { color: '#2962ff', width: 2, dash: 'solid', fillOpacity: 0.12 },
+                        locked: false,
+                        hidden: false,
+                        createdAt: 1,
+                    },
+                ],
+            }),
+        );
+        reloadDrawingsFromStorage();
+        const d = getDrawings('TXF')[0]!;
+        expect(d).toMatchObject({ id: 'old', tool: 'trend', style: { color: '#2962ff' } });
+        expect(d.name).toBeUndefined();
+        expect(drawingLabel(d)).toBe('趨勢線');
+    });
+
+    it('新工具的控制點數：垂直線／文字 1、平行通道 3、斐波那契 2', () => {
+        expect(anchorCount('vertical')).toBe(1);
+        expect(anchorCount('text')).toBe(1);
+        expect(anchorCount('channel')).toBe(3);
+        expect(anchorCount('fib')).toBe(2);
+        expect(sanitizeDrawing({ id: 'c', tool: 'channel', anchors: [{ time: 1, price: 1 }, { time: 2, price: 2 }] })).toBeNull();
+    });
+
+    it('文字截斷、斐波那契比例清理、名稱修剪；非文字物件不帶 text', () => {
+        const t = sanitizeDrawing({
+            id: 't',
+            tool: 'text',
+            anchors: [{ time: 1, price: 1 }],
+            text: 'x'.repeat(MAX_TEXT_LENGTH + 50),
+            name: '  支撐  ',
+        })!;
+        expect(t.text).toHaveLength(MAX_TEXT_LENGTH);
+        expect(t.name).toBe('支撐');
+        const f = sanitizeDrawing({
+            id: 'f',
+            tool: 'fib',
+            anchors: [
+                { time: 1, price: 1 },
+                { time: 2, price: 2 },
+            ],
+            levels: [1, 0.5, 'x', 0.5, 99, NaN, 0],
+        })!;
+        // #224 第一版的數字陣列轉成新格式，顏色沿用 TradingView 預設順序
+        expect(f.fib!.levels.map((l) => [l.value, l.token, l.visible])).toEqual([
+            [0, 'grey', true],
+            [0.5, 'green', true],
+            [1, 'grey', true],
+        ]);
+        expect(fibOptionsOf(sanitizeDrawing({ ...f, fib: undefined, levels: 'bad' })!).levels).toHaveLength(7);
+        expect(sanitizeDrawing({ id: 'h', tool: 'horizontal', anchors: [{ time: 1, price: 1 }], text: 'no' })!.text).toBeUndefined();
+    });
+
+    it('設定：收藏、每組最後用的工具、磁吸、物件列表都驗證過', () => {
+        const s = sanitizeSettings({
+            favorites: ['trend', 'bogus', 'measure', 'trend'],
+            groupLast: { lines: 'vertical', shapes: 'trend', measure: 'measure' },
+            magnet: 'yes',
+            objectListOpen: true,
+        });
+        expect(s.favorites).toEqual(['trend', 'measure']);
+        expect(s.groupLast).toEqual({ lines: 'vertical', measure: 'measure' });
+        expect(s.magnet).toBe(false);
+        expect(s.objectListOpen).toBe(true);
+        expect(sanitizeSettings({}).favorites).toEqual([]);
+    });
+
+    it('調整圖層：移動後寫出新順序；對方同時新增的物件保留在後面', () => {
+        const a = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        const b = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        const c = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        flushDrawingWrites();
+        moveDrawing('TXF', c.id, 0);
+        expect(getDrawings('TXF').map((d) => d.id)).toEqual([c.id, a.id, b.id]);
+        // 對方視窗（還是舊順序）加了 z
+        store.set(KEY, JSON.stringify({ TXF: [...saved().TXF!, { ...a, id: 'z' }] }));
+        reloadDrawingsFromStorage();
+        expect(getDrawings('TXF').map((d) => d.id)).toEqual([c.id, a.id, b.id, 'z']);
+        flushDrawingWrites();
+        expect(saved().TXF!.map((d) => d.id)).toEqual([c.id, a.id, b.id, 'z']);
+    });
+
+    it('多選刪除保留鎖定的；全部鎖定／解鎖；整份換掉依物件記差異', () => {
+        const a = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        const b = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        updateDrawing('TXF', b.id, { locked: true });
+        removeDrawings('TXF', [a.id, b.id]);
+        expect(getDrawings('TXF').map((d) => d.id)).toEqual([b.id]);
+        setDrawingsLocked('TXF', false);
+        expect(getDrawings('TXF')[0]!.locked).toBe(false);
+        setDrawingsLocked('TXF', true);
+        expect(getDrawings('TXF')[0]!.locked).toBe(true);
+        const c = { ...getDrawings('TXF')[0]!, id: 'c' };
+        replaceDrawings('TXF', [...getDrawings('TXF'), c]);
+        flushDrawingWrites();
+        expect(saved().TXF!.map((d) => d.id)).toEqual([b.id, 'c']);
+    });
+
+    it('複製保留文字與斐波那契比例', () => {
+        const t = addDrawing('TXF', 'text', [anchors[0]!], DEFAULT_DRAWING_STYLE, { text: '支撐' })!;
+        const f = addDrawing('TXF', 'fib', anchors, DEFAULT_DRAWING_STYLE, {
+            fib: { ...defaultFibOptions(), labelH: 'right', levels: defaultFibLevels().slice(0, 3) },
+        })!;
+        expect(duplicateDrawing('TXF', t.id, (a) => a)!.text).toBe('支撐');
+        const copy = duplicateDrawing('TXF', f.id, (a) => a)!;
+        expect(copy.fib!.labelH).toBe('right');
+        expect(copy.fib!.levels.map((l) => l.value)).toEqual([0, 0.236, 0.382]);
+    });
+});
+
 describe('review 修正：跨視窗鎖、墓碑、上限、設定合併', () => {
     const KEY = 'sj-pro-chart-drawings';
     const TKEY = 'sj-pro-chart-drawing-tombstones';
@@ -490,18 +627,30 @@ describe('review 修正：跨視窗鎖、墓碑、上限、設定合併', () => 
         expect(Object.keys(JSON.parse(store.get(TKEY)!).TXF)).toEqual(['fresh']);
     });
 
-    it('載入時也守住每個商品的上限，保留最新的，順序不變', () => {
-        const list = Array.from({ length: MAX_DRAWINGS_PER_SYMBOL + 50 }, (_, i) => ({
+    it('載入時只有異常巨大的資料才截斷（硬上限 1000，保留最新的、順序不變），並通知', () => {
+        const list = Array.from({ length: HARD_MAX_DRAWINGS_PER_SYMBOL + 50 }, (_, i) => ({
             ...theirs(`d${i}`),
             createdAt: i,
             updatedAt: i,
         }));
         store.set(KEY, JSON.stringify({ TXF: list }));
+        takeDrawingNotices();
         reloadDrawingsFromStorage();
         const got = getDrawings('TXF');
-        expect(got).toHaveLength(MAX_DRAWINGS_PER_SYMBOL);
+        expect(got).toHaveLength(HARD_MAX_DRAWINGS_PER_SYMBOL);
         expect(got[0]!.id).toBe('d50');
-        expect(got.at(-1)!.id).toBe(`d${MAX_DRAWINGS_PER_SYMBOL + 49}`);
+        expect(got.at(-1)!.id).toBe(`d${HARD_MAX_DRAWINGS_PER_SYMBOL + 49}`);
+        expect(takeDrawingNotices()).toHaveLength(1);
+        // 同一則不重複通知
+        reloadDrawingsFromStorage();
+        expect(takeDrawingNotices()).toHaveLength(0);
+    });
+
+    it('軟上限（200）超量的正常資料載入時不刪', () => {
+        const list = Array.from({ length: MAX_DRAWINGS_PER_SYMBOL + 5 }, (_, i) => theirs(`d${i}`));
+        store.set(KEY, JSON.stringify({ TXF: list }));
+        reloadDrawingsFromStorage();
+        expect(getDrawings('TXF')).toHaveLength(MAX_DRAWINGS_PER_SYMBOL + 5);
     });
 
     it('設定依欄位合併：兩個視窗各改不同欄位，兩邊都留下', () => {
@@ -517,6 +666,25 @@ describe('review 修正：跨視窗鎖、墓碑、上限、設定合併', () => 
         const s = JSON.parse(store.get('sj-pro-chart-drawing-settings')!);
         expect(s.shareContinuousMonth).toBe(false);
         expect(s.defaultStyle.width).toBe(4);
+    });
+});
+
+describe('線條不透明度', () => {
+    it('舊資料沒有 opacity → 1（外觀不變）；壞值夾在 0.1～1', () => {
+        const base = { id: 'x', tool: 'horizontal', anchors: [{ time: 1, price: 2 }] };
+        expect(sanitizeDrawing({ ...base, style: { color: '#123456' } })!.style.opacity).toBe(1);
+        expect(sanitizeDrawing({ ...base, style: { opacity: 0 } })!.style.opacity).toBe(0.1);
+        expect(sanitizeDrawing({ ...base, style: { opacity: 'x' } })!.style.opacity).toBe(1);
+    });
+
+    it('新物件預設略透明、依主題；使用者挑過的不透明度優先', () => {
+        const s = sanitizeSettings({});
+        expect(defaultStyleFor(s, 'trend', 'dark').opacity).toBe(DEFAULT_LINE_OPACITY.dark);
+        expect(defaultStyleFor(s, 'trend', 'light').opacity).toBe(DEFAULT_LINE_OPACITY.light);
+        expect(DEFAULT_LINE_OPACITY.dark).toBeLessThan(1);
+        const picked = sanitizeSettings({ lineOpacity: 0.5 });
+        expect(defaultStyleFor(picked, 'box', 'dark').opacity).toBe(0.5);
+        expect(sanitizeSettings({ lineOpacity: 7 }).lineOpacity).toBe(1);
     });
 });
 
@@ -588,6 +756,19 @@ describe('關窗日誌：pagehide 不在鎖外動主項目', () => {
     });
 });
 
+describe('關窗日誌也帶圖層順序', () => {
+    it('關窗前調整的圖層順序，下一個寫入者照樣套用', () => {
+        const a = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        const b = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        flushDrawingWrites();
+        moveDrawing('TXF', b.id, 0);
+        writeDrawingJournal();
+        flushDrawingWrites();
+        const saved = JSON.parse(store.get('sj-pro-chart-drawings')!).TXF.map((d: { id: string }) => d.id);
+        expect(saved).toEqual([b.id, a.id]);
+    });
+});
+
 describe('round 4：初始化順序、日誌只刪合併過的那一版', () => {
     const journal = (id: string) =>
         JSON.stringify({
@@ -656,5 +837,49 @@ describe('round 4：初始化順序、日誌只刪合併過的那一版', () => 
         addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE);
         writeDrawingJournal();
         expect([...store.keys()].filter((k) => k.startsWith('sj-chart-drawings-pending:'))).toHaveLength(2);
+    });
+});
+
+describe('round 5：墓碑不刪較新的版本、合併不默默丟物件', () => {
+    const KEY = 'sj-pro-chart-drawings';
+    const TKEY = 'sj-pro-chart-drawing-tombstones';
+    const obj = (id: string, updatedAt: number) => ({
+        id,
+        tool: 'horizontal',
+        anchors: [{ time: 1000, price: 25000 }],
+        style: DEFAULT_DRAWING_STYLE,
+        locked: false,
+        hidden: false,
+        createdAt: 1,
+        updatedAt,
+    });
+
+    it('被墓碑否決的舊修改，不會連帶刪掉主項目裡比墓碑新的同 id 版本（刪除後重建）', () => {
+        const x = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!; // 本視窗待寫的修改（較舊）
+        const deletedAt = x.updatedAt + 10;
+        store.set(TKEY, JSON.stringify({ TXF: { [x.id]: deletedAt } }));
+        // 別的視窗在刪除之後又重建了同 id 的物件（例如復原）
+        store.set(KEY, JSON.stringify({ TXF: [obj(x.id, deletedAt + 10)] }));
+        reloadDrawingsFromStorage();
+        expect(getDrawings('TXF').map((d) => d.updatedAt)).toEqual([deletedAt + 10]);
+        flushDrawingWrites();
+        const saved = JSON.parse(store.get(KEY)!).TXF;
+        expect(saved).toHaveLength(1);
+        expect(saved[0].updatedAt).toBe(deletedAt + 10);
+    });
+
+    it('兩個視窗各自在上限附近新增：合併後全部保留（暫時超過上限）並通知，之後新增被擋', () => {
+        const mine = addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)!;
+        // 另一個視窗已有 200 個（它看不到本視窗這一個）
+        store.set(KEY, JSON.stringify({ TXF: Array.from({ length: MAX_DRAWINGS_PER_SYMBOL }, (_, i) => obj(`o${i}`, 1)) }));
+        takeDrawingNotices();
+        flushDrawingWrites();
+        const saved = JSON.parse(store.get(KEY)!).TXF;
+        expect(saved).toHaveLength(MAX_DRAWINGS_PER_SYMBOL + 1);
+        expect(saved.some((d: { id: string }) => d.id === mine.id)).toBe(true);
+        expect(takeDrawingNotices()).toHaveLength(1);
+        reloadDrawingsFromStorage();
+        expect(getDrawings('TXF')).toHaveLength(MAX_DRAWINGS_PER_SYMBOL + 1);
+        expect(addDrawing('TXF', 'trend', anchors, DEFAULT_DRAWING_STYLE)).toBeNull();
     });
 });

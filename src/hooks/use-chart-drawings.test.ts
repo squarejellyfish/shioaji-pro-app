@@ -3,7 +3,10 @@ import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
     chartHasFocus,
+    inOrderLabelArea,
     orderLineMayTakePointer,
+    toolShortcutOf,
+    undoKeyOf,
     useChartDrawings,
     type ChartDrawingsApi,
 } from './use-chart-drawings';
@@ -300,7 +303,7 @@ describe('鍵盤只歸一張圖，且不擋 Esc×2 全部刪單', () => {
         expect(keyListeners.size).toBe(0);
     });
 
-    it('選取中按 Esc 取消選取並吃掉這一下 — 不算進 Esc×2 全刪單', async () => {
+    it('選取中按 Esc 取消選取（關閉浮動工具列）並吃掉這一下 — 不算進 Esc×2 全刪單', async () => {
         const api = await mountChart();
         const d = line(25000);
         await act(async () => api().select(d.id));
@@ -430,6 +433,19 @@ describe('鍵盤只歸一張圖，且不擋 Esc×2 全部刪單', () => {
             await settle();
         });
         expect(hk.cancelAll).not.toHaveBeenCalled();
+    });
+
+    it('Esc（武裝）→ 被元件擋下的 Esc → 下一個 Esc 緊接著到（中間沒有計時器）：不會全部刪單', async () => {
+        await act(async () => {
+            roots.push(create(createElement(HotkeysProbe)));
+        });
+        await act(async () => {
+            press('Escape'); // 第一下：武裝
+            press('Escape', { stopAtTarget: true }); // 被元件吃掉
+            press('Escape'); // 緊接著：在捕獲階段先結清上一下 → 只算新的第一下
+        });
+        expect(hk.cancelAll).not.toHaveBeenCalled();
+        expect(hk.notify).toHaveBeenCalledTimes(2);
     });
 
     it('被算成第一下的 Esc 不會被自己的保險計時器清掉：Esc、Esc 照常全部刪單', async () => {
@@ -692,6 +708,22 @@ describe('滑鼠：交易模式與委託線優先於畫圖物件', () => {
         expect(orderLineMayTakePointer({ ...base, drawingBusy: true, inGrip: true })).toBe(true);
     });
 
+    it('未選取的畫圖物件延伸到價格軸前的繪圖區、與委託線重疊：委託線不接手；只有價格軸上的委託標籤可以拖', () => {
+        const hostWidth = 1000;
+        const axis = 70;
+        const base = { drawingArmed: false, defaultPrevented: false, drawingHit: 'other' as const };
+        // 舊版的 90px 把手帶（價格軸左邊）現在屬於繪圖區
+        for (const x of [hostWidth - axis - 89, hostWidth - axis - 30, hostWidth - axis - 1]) {
+            expect(inOrderLabelArea(x, hostWidth, axis)).toBe(false);
+            expect(orderLineMayTakePointer({ ...base, inGrip: inOrderLabelArea(x, hostWidth, axis) })).toBe(false);
+        }
+        // 價格軸上的委託標籤
+        expect(inOrderLabelArea(hostWidth - axis + 5, hostWidth, axis)).toBe(true);
+        expect(orderLineMayTakePointer({ ...base, inGrip: true })).toBe(true);
+        // 沒有畫圖時照舊整條線都能拖
+        expect(orderLineMayTakePointer({ drawingArmed: false, defaultPrevented: false, drawingHit: null })).toBe(true);
+    });
+
     it('drawingAt：游標下的畫圖物件是選取中的還是其他的', async () => {
         const api = await setup(false);
         expect(api().drawingAt({ clientX: 20, clientY: 200 })).toBe('other');
@@ -733,5 +765,353 @@ describe('滑鼠：交易模式與委託線優先於畫圖物件', () => {
         });
         expect(e.stopPropagation).not.toHaveBeenCalled();
         expect(api().selected).toBeNull();
+    });
+});
+
+describe('第一期：多選、平行通道、量測、文字、復原、快捷鍵', () => {
+    type L = (e: unknown) => void;
+    const hostL = new Map<string, L>();
+    const docL = new Map<string, L>();
+    const keyL = new Set<L>();
+    const inside = { tagName: 'CANVAS' };
+    const scope = { contains: (n: unknown) => n === inside };
+    const host = {
+        style: { cursor: '' },
+        dataset: {},
+        parentElement: scope,
+        addEventListener: (t: string, l: L) => hostL.set(t, l),
+        removeEventListener: (t: string) => hostL.delete(t),
+    };
+    let layer: { state: { draft: unknown; measure: unknown } } | null = null;
+    const series = {
+        priceToCoordinate: (p: number) => 25200 - p,
+        coordinateToPrice: (y: number) => 25200 - y,
+        priceFormatter: () => ({ format: String }),
+        attachPrimitive(l: {
+            attached: (p: unknown) => void;
+            noteCanvas: (c: unknown, s: unknown) => void;
+            state: { draft: unknown; measure: unknown };
+        }) {
+            layer = l;
+            l.attached({
+                series,
+                chart: { timeScale: () => ({ logicalToCoordinate: (x: number) => x * 10 }) },
+                requestUpdate() {},
+            });
+            l.noteCanvas(
+                { getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 400 }) },
+                { width: 800, height: 400 },
+            );
+        },
+        detachPrimitive() {},
+    };
+
+    // 與真實元件一樣用穩定的 ref（每次 render 換新物件會讓 effect 重掛）
+    const refs = {
+        host: { current: host as unknown as HTMLDivElement },
+        chart: { current: { applyOptions() {} } as never },
+        series: { current: series as never },
+    };
+    const v2Bars = [
+        { time: 1000, open: 24990, high: 25010, low: 24980, close: 25005 },
+        { time: 1060, open: 25005, high: 25050, low: 25000, close: 25040 },
+        { time: 1120, open: 25090, high: 25110, low: 25080, close: 25100 },
+        { time: 1180, open: 25100, high: 25130, low: 25090, close: 25120 },
+    ];
+    function V2Probe({ receive }: { receive: (v: ChartDrawingsApi) => void }) {
+        receive(
+            useChartDrawings({
+                contract,
+                hostRef: refs.host,
+                chartRef: refs.chart,
+                seriesRef: refs.series,
+                getTimes: () => [1000, 1060, 1120, 1180],
+                tradeArmed: false,
+                onEnterDrawingMode: () => {},
+                pnlPerPoint: 200,
+                getBars: () => v2Bars,
+            }),
+        );
+        return null;
+    }
+
+    beforeEach(() => {
+        hostL.clear();
+        docL.clear();
+        keyL.clear();
+        vi.stubGlobal('document', {
+            activeElement: inside,
+            addEventListener: (t: string, l: L) => docL.set(t, l),
+            removeEventListener: (t: string) => docL.delete(t),
+        });
+        vi.stubGlobal('window', {
+            addEventListener: (t: string, l: L) => t === 'keydown' && keyL.add(l),
+            removeEventListener: (t: string, l: L) => keyL.delete(l),
+        });
+    });
+
+    async function setup() {
+        let api!: ChartDrawingsApi;
+        await act(async () => {
+            roots.push(create(createElement(V2Probe, { receive: (v) => (api = v) })));
+        });
+        return () => api;
+    }
+
+    const ev = (x: number, y: number, extra: Record<string, unknown> = {}) => ({
+        button: 0,
+        clientX: x,
+        clientY: y,
+        shiftKey: false,
+        defaultPrevented: false,
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+        ...extra,
+    });
+    const down = async (x: number, y: number, extra: Record<string, unknown> = {}) => {
+        const e = ev(x, y, extra);
+        await act(async () => hostL.get('mousedown')!(e));
+        return e;
+    };
+    const up = async (x: number, y: number) => {
+        await act(async () => docL.get('mouseup')?.(ev(x, y)));
+    };
+    const key = async (k: Record<string, unknown>) => {
+        const e = {
+            key: '',
+            code: '',
+            target: null,
+            ctrlKey: false,
+            metaKey: false,
+            shiftKey: false,
+            altKey: false,
+            defaultPrevented: false,
+            preventDefault() {
+                this.defaultPrevented = true;
+            },
+            ...k,
+        };
+        await act(async () => {
+            for (const l of [...keyL]) l(e);
+        });
+        return e;
+    };
+
+    it('平行通道點三下：基準線兩點＋決定寬度的第三點', async () => {
+        const api = await setup();
+        await act(async () => api().setTool('channel'));
+        await down(100, 200);
+        await down(300, 100);
+        expect(api().drawings).toHaveLength(0); // 還在等第三點
+        await down(200, 250);
+        expect(api().drawings).toHaveLength(1);
+        expect(api().drawings[0]!.tool).toBe('channel');
+        expect(api().drawings[0]!.anchors).toHaveLength(3);
+        expect(api().tool).toBeNull();
+    });
+
+    it('Shift 點選多選，一起拖曳、一起刪除', async () => {
+        const api = await setup();
+        const a = addDrawing('TXF', 'horizontal', [{ time: 1000, price: 25000 }], DEFAULT_DRAWING_STYLE)!;
+        const b = addDrawing('TXF', 'horizontal', [{ time: 1000, price: 24900 }], DEFAULT_DRAWING_STYLE)!;
+        await act(async () => {});
+        await down(50, 200); // a（y=200）
+        await up(50, 200);
+        await down(50, 300, { shiftKey: true }); // b（y=300）
+        expect(api().selectedIds).toEqual([a.id, b.id]);
+        await up(50, 280); // 往上拖 20px
+        expect(api().drawings.map((d) => d.anchors[0]!.price)).toEqual([25020, 24920]);
+        const e = await key({ key: 'Delete' });
+        expect(e.defaultPrevented).toBe(true);
+        expect(api().drawings).toEqual([]);
+    });
+
+    it('復原／重做：Ctrl+Z、Ctrl+Shift+Z、Ctrl+Y；焦點不在圖上時不作用', async () => {
+        const api = await setup();
+        await act(async () => api().setTool('horizontal'));
+        await down(50, 150);
+        expect(api().drawings).toHaveLength(1);
+        expect(api().canUndo).toBe(true);
+        let e = await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(e.defaultPrevented).toBe(true);
+        expect(api().drawings).toHaveLength(0);
+        await key({ key: 'Z', code: 'KeyZ', metaKey: true, shiftKey: true });
+        expect(api().drawings).toHaveLength(1);
+        await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        await key({ key: 'y', code: 'KeyY', ctrlKey: true });
+        expect(api().drawings).toHaveLength(1);
+        // 焦點在別的面板
+        vi.stubGlobal('document', { activeElement: { tagName: 'BUTTON' }, addEventListener() {}, removeEventListener() {} });
+        e = await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(e.defaultPrevented).toBe(false);
+        expect(api().drawings).toHaveLength(1);
+    });
+
+    it('拖曳結束算一步，可復原回原位', async () => {
+        const api = await setup();
+        addDrawing('TXF', 'horizontal', [{ time: 1000, price: 25000 }], DEFAULT_DRAWING_STYLE);
+        await act(async () => {});
+        await down(50, 200);
+        await up(50, 150);
+        expect(api().drawings[0]!.anchors[0]!.price).toBe(25050);
+        await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(api().drawings[0]!.anchors[0]!.price).toBe(25000);
+    });
+
+    it('Alt＋字母切換工具（依 code，不看 Option 產生的符號）', async () => {
+        const api = await setup();
+        await down(700, 50); // 點圖：握有鍵盤
+        const e = await key({ key: '†', code: 'KeyT', altKey: true });
+        expect(e.defaultPrevented).toBe(true);
+        expect(api().tool).toBe('trend');
+        await key({ key: '˙', code: 'KeyH', altKey: true });
+        expect(api().tool).toBe('horizontal');
+        expect(toolShortcutOf({ code: 'KeyF', altKey: true, ctrlKey: false, metaKey: false, shiftKey: false })).toBe('fib');
+        expect(undoKeyOf({ key: 'z', code: 'KeyZ', ctrlKey: false, metaKey: false, shiftKey: false, altKey: false })).toBeNull();
+    });
+
+    it('價差量測：點兩下量完、Esc 清除且吃掉這一下（不算進 Esc×2）', async () => {
+        const api = await setup();
+        await act(async () => api().setTool('measure'));
+        await down(10, 200);
+        await down(30, 80);
+        expect(api().measuring).toBe(true);
+        expect(api().tool).toBeNull();
+        const m = layer!.state.measure as { label: string; stats: { points: number; bars: number; pnl: number } };
+        expect(m.stats.points).toBe(120);
+        expect(m.stats.bars).toBe(2);
+        expect(m.stats.pnl).toBe(24000);
+        expect(m.label).toContain('+120 點');
+        expect(api().drawings).toEqual([]); // 量測不存檔
+        const e = await key({ key: 'Escape' });
+        expect(e.defaultPrevented).toBe(true);
+        expect(api().measuring).toBe(false);
+    });
+
+    it('量完後點一下圖表就清除量測，這一下不做別的事', async () => {
+        const api = await setup();
+        await act(async () => api().setTool('measure'));
+        await down(10, 200);
+        await down(30, 80);
+        const e = await down(300, 300);
+        expect(e.preventDefault).toHaveBeenCalled();
+        expect(api().measuring).toBe(false);
+    });
+
+    it('文字註記：放下後開輸入框，確定才存；空白取消整筆不留、也不進復原', async () => {
+        const api = await setup();
+        await act(async () => api().setTool('text'));
+        await down(100, 100);
+        const id = api().editingTextId!;
+        expect(id).toBeTruthy();
+        await act(async () => api().commitText('月線支撐'));
+        expect(api().drawings.find((d) => d.id === id)?.text).toBe('月線支撐');
+        expect(api().canUndo).toBe(true);
+
+        await act(async () => api().setTool('text'));
+        await down(200, 100);
+        expect(api().drawings).toHaveLength(2);
+        await act(async () => api().commitText(null));
+        expect(api().drawings).toHaveLength(1);
+        await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(api().drawings).toHaveLength(0); // 復原的是第一筆文字
+    });
+
+    it('斐波那契設定：改選項會驗證、連續拉色帶合併成一步復原', async () => {
+        const api = await setup();
+        const f = addDrawing('TXF', 'fib', [{ time: 1000, price: 1 }, { time: 1060, price: 2 }], DEFAULT_DRAWING_STYLE)!;
+        await act(async () => {});
+        await down(700, 350); // 取得鍵盤
+        await act(async () => api().setFib(f.id, { labelH: 'right', fontSize: 99 }));
+        expect(api().drawings[0]!.fib).toMatchObject({ labelH: 'right', fontSize: 16 });
+        for (const o of [0.1, 0.2, 0.3]) await act(async () => api().setFib(f.id, { bandOpacity: o }));
+        expect(api().drawings[0]!.fib!.bandOpacity).toBe(0.3);
+        await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(api().drawings[0]!.fib!.bandOpacity).toBe(0.12); // 三次拉動算一步
+        expect(api().drawings[0]!.fib!.labelH).toBe('right');
+        await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(api().drawings[0]!.fib!.labelH).toBe('left');
+    });
+
+    it('磁吸只作用在被拖的那一點，其他控制點維持原本的時間與價格', async () => {
+        const api = await setup();
+        const t = addDrawing('TXF', 'trend', [{ time: 1000, price: 25000 }, { time: 1180, price: 25100 }], DEFAULT_DRAWING_STYLE)!;
+        await act(async () => api().setMagnet(true));
+        await down(30, 100); // 第二點（x=30, y=100）
+        await up(20, 95); // 拖到第三根 K 棒附近
+        const d = api().drawings.find((x) => x.id === t.id)!;
+        expect(d.anchors[0]).toEqual({ time: 1000, price: 25000 }); // 沒被吸走
+        expect(d.anchors[1]!.time).toBe(1120);
+        expect([25090, 25110, 25080, 25100]).toContain(d.anchors[1]!.price);
+    });
+
+    it('拖曳期間別的視窗的改動，復原拖曳時不會一起被復原', async () => {
+        const api = await setup();
+        addDrawing('TXF', 'horizontal', [{ time: 1000, price: 25000 }], DEFAULT_DRAWING_STYLE);
+        await act(async () => {});
+        await down(50, 200);
+        // 拖曳中另一個視窗新增了一條線（同步進來）
+        const theirs = addDrawing('TXF', 'horizontal', [{ time: 1000, price: 24800 }], DEFAULT_DRAWING_STYLE)!;
+        await up(50, 150);
+        expect(api().drawings.map((d) => d.anchors[0]!.price)).toEqual([25050, 24800]);
+        await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(api().drawings.map((d) => d.anchors[0]!.price)).toEqual([25000, 24800]);
+        expect(api().drawings.some((d) => d.id === theirs.id)).toBe(true);
+    });
+
+    it('量測結果顯示中算「畫圖佔用滑鼠」：委託線只能從把手區拖', async () => {
+        const api = await setup();
+        await act(async () => api().setTool('measure'));
+        await down(10, 200);
+        await down(30, 80);
+        expect(api().tool).toBeNull();
+        expect(api().drawingBusy()).toBe(true);
+        expect(orderLineMayTakePointer({ drawingArmed: false, defaultPrevented: false, drawingBusy: true })).toBe(false);
+        await key({ key: 'Escape' });
+        expect(api().drawingBusy()).toBe(false);
+    });
+
+    it('價格標籤依商品跳動價位顯示（TXF 1 點），存的仍是原始值', async () => {
+        const api = await setup();
+        expect(api().formatPrice(48692.46)).toBe('48,692');
+        expect(api().formatPrice(48692.46, false)).toBe('48692');
+        await act(async () => api().setTool('trend'));
+        await act(async () => api().setTool(null)); // 觸發一次 pushState
+        const l = layer as unknown as { formatPrice: (p: number) => string; formatAxis: (p: number) => string };
+        expect(l.formatPrice(48692.46)).toBe('48,692');
+        expect(l.formatAxis(48692.46)).toBe('48692');
+        const f = addDrawing('TXF', 'horizontal', [{ time: 1000, price: 25000.4 }], DEFAULT_DRAWING_STYLE)!;
+        expect(f.anchors[0]!.price).toBe(25000.4);
+    });
+
+    it('不透明度：套到選取的物件、記成下一個物件的預設，連續拖動合併成一步復原', async () => {
+        const api = await setup();
+        await act(async () => api().setTool('horizontal'));
+        await down(50, 150);
+        expect(api().selected!.style.opacity).toBe(0.85); // 深色主題預設略透明
+        for (const o of [0.7, 0.6, 0.5]) await act(async () => api().applyStyle({ opacity: o }));
+        expect(api().selected!.style.opacity).toBe(0.5);
+        expect(getDrawingSettings().lineOpacity).toBe(0.5);
+        await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(api().drawings[0]!.style.opacity).toBe(0.85);
+    });
+
+    it('物件列表操作：改名、隱藏、鎖定、調整圖層都可復原', async () => {
+        const api = await setup();
+        const a = addDrawing('TXF', 'trend', [{ time: 1000, price: 1 }, { time: 1060, price: 2 }], DEFAULT_DRAWING_STYLE)!;
+        const b = addDrawing('TXF', 'trend', [{ time: 1000, price: 1 }, { time: 1060, price: 2 }], DEFAULT_DRAWING_STYLE)!;
+        await act(async () => {});
+        await down(700, 350); // 取得鍵盤（空白處）
+        await act(async () => api().rename(a.id, '  壓力線 '));
+        expect(api().drawings[0]!.name).toBe('壓力線');
+        await act(async () => api().reorder(b.id, 0));
+        expect(api().drawings.map((d) => d.id)).toEqual([b.id, a.id]);
+        await act(async () => api().setHidden(a.id, true));
+        await act(async () => api().setLocked(a.id, true));
+        expect(api().allLocked).toBe(false);
+        for (let i = 0; i < 4; i++) await key({ key: 'z', code: 'KeyZ', ctrlKey: true });
+        expect(api().drawings.map((d) => d.id)).toEqual([a.id, b.id]);
+        expect(api().drawings[0]).toMatchObject({ hidden: false, locked: false });
+        expect(api().drawings[0]!.name).toBeUndefined();
     });
 });

@@ -1,9 +1,7 @@
 import { createElement } from 'react';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { placeStylePopover, PriceInput, StylePopover } from './chart-drawing-tools';
-import type { ChartDrawingsApi } from '../hooks/use-chart-drawings';
-import { DEFAULT_DRAWING_STYLE } from '../lib/chart-drawings';
+import { isImeKey, parseLevels, placeFloatingToolbar, placeStylePopover, Popover, PriceInput, TextEditor } from './chart-drawing-tools';
 import { escStackDepth } from '../hooks/use-esc-close';
 
 // 瀏覽器裡 blur() 會同步觸發 onBlur — 替身照做，才重現得出「Esc 之後
@@ -85,27 +83,12 @@ describe('樣式面板的位置：不被 K 線面板裁切，每個控制項都�
     });
 });
 
-describe('樣式面板：Esc 與點外面關閉', () => {
+describe('彈出層（工具組、色盤、線寬）：Esc 與點外面關閉', () => {
     const keyListeners = new Set<(e: KeyboardEvent) => void>();
     const downListeners = new Set<(e: Event) => void>();
     let active: unknown = null;
     const popChild = { tagName: 'BUTTON' };
     const priceInput = { tagName: 'INPUT' };
-
-    const api = {
-        tool: null,
-        selected: null,
-        style: DEFAULT_DRAWING_STYLE,
-        drawings: [],
-        symbolKey: 'TXF',
-        shareContinuousMonth: true,
-        applyStyle: vi.fn(),
-        clearAll: vi.fn(),
-        showAll: vi.fn(),
-        setSelectedPrice: vi.fn(),
-        setShareContinuousMonth: vi.fn(),
-        focusChart: vi.fn(),
-    } as unknown as ChartDrawingsApi;
 
     const anchorEl = { tagName: 'BUTTON' };
     const anchor = {
@@ -145,7 +128,7 @@ describe('樣式面板：Esc 與點外面關閉', () => {
         const onClose = vi.fn();
         await act(async () => {
             view = create(
-                createElement(StylePopover, { api, anchor, onClose }),
+                createElement(Popover, { anchor, onClose, label: '測試', children: null }),
                 // popRef 需要一個 contains()：面板內的元素只有 popChild 與 priceInput
                 { createNodeMock: () => ({ contains: (n: unknown) => n === popChild || n === priceInput, ownerDocument: anchor.ownerDocument, scrollHeight: 300, offsetWidth: 240 }) },
             );
@@ -185,5 +168,64 @@ describe('樣式面板：Esc 與點外面關閉', () => {
         expect(onClose).toHaveBeenCalledTimes(1);
         // 點外面關閉：不把焦點搶回圖表（呼叫端依 reason 決定）
         expect(onClose).toHaveBeenCalledWith('outside');
+    });
+});
+
+describe('浮動物件工具列的位置：留在圖表內，放不下就翻面', () => {
+    const host = { width: 800, height: 400 };
+    const bar = { width: 220, height: 30 };
+
+    it('預設在物件上方置中', () => {
+        expect(placeFloatingToolbar({ left: 300, top: 200, right: 500, bottom: 260 }, bar, host)).toEqual({
+            left: 290,
+            top: 162,
+            flipped: false,
+        });
+    });
+
+    it('物件貼近上緣時翻到下方', () => {
+        const p = placeFloatingToolbar({ left: 300, top: 10, right: 500, bottom: 60 }, bar, host);
+        expect(p.flipped).toBe(true);
+        expect(p.top).toBe(68);
+    });
+
+    it('上下都放不下（物件佔滿整個高度）時壓在圖表內', () => {
+        const p = placeFloatingToolbar({ left: 300, top: 0, right: 500, bottom: 400 }, bar, host);
+        expect(p.top).toBeGreaterThanOrEqual(4);
+        expect(p.top + bar.height).toBeLessThanOrEqual(host.height - 4);
+    });
+
+    it('左右夾在圖表內（水平線橫跨整個畫面、物件跑出畫面）', () => {
+        expect(placeFloatingToolbar({ left: -500, top: 200, right: 20, bottom: 200 }, bar, host).left).toBe(4);
+        expect(placeFloatingToolbar({ left: 780, top: 200, right: 2000, bottom: 200 }, bar, host).left).toBe(800 - 220 - 4);
+    });
+});
+
+describe('斐波那契比例輸入', () => {
+    it('逗號、空白、全形逗號都能分隔，忽略看不懂的字', () => {
+        expect(parseLevels('0, 0.236，0.382 0.5、abc, 1')).toEqual([0, 0.236, 0.382, 0.5, 1]);
+        expect(parseLevels('')).toEqual([]);
+    });
+});
+
+describe('輸入法組字中的 Enter／Esc 不算完成或取消', () => {
+    it('isImeKey：isComposing 或 keyCode 229', () => {
+        expect(isImeKey({ nativeEvent: { isComposing: true } })).toBe(true);
+        expect(isImeKey({ keyCode: 229 })).toBe(true);
+        expect(isImeKey({ nativeEvent: { isComposing: false }, keyCode: 13 })).toBe(false);
+    });
+
+    it('文字註記：選字的 Enter 不提交，組字結束後的 Enter 才提交', async () => {
+        const onCommit = vi.fn();
+        await act(async () => {
+            view = create(createElement(TextEditor, { initial: '', box: { left: 0, top: 0 }, onCommit }));
+        });
+        const ta = () => view.root.findByType('textarea');
+        await act(async () => ta().props.onChange({ target: { value: '月線' } }));
+        const ev = (extra: object) => ({ key: 'Enter', shiftKey: false, preventDefault() {}, stopPropagation() {}, ...extra });
+        await act(async () => ta().props.onKeyDown(ev({ nativeEvent: { isComposing: true }, keyCode: 229 })));
+        expect(onCommit).not.toHaveBeenCalled();
+        await act(async () => ta().props.onKeyDown(ev({ nativeEvent: { isComposing: false }, keyCode: 13 })));
+        expect(onCommit).toHaveBeenCalledWith('月線');
     });
 });

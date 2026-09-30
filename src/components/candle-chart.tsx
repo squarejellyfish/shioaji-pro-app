@@ -40,7 +40,12 @@ import {
     useChartDrawings,
     type ChartDrawingsApi,
 } from '../hooks/use-chart-drawings';
-import { takeDrawingSaveErrorNotice, useDrawingsSaveFailed } from '../lib/chart-drawings';
+import {
+    takeDrawingNotices,
+    takeDrawingSaveErrorNotice,
+    useDrawingNotices,
+    useDrawingsSaveFailed,
+} from '../lib/chart-drawings';
 import { useQuote } from '../hooks/use-stream';
 import {
     colorWithOpacity,
@@ -132,7 +137,8 @@ import {
 } from '../lib/utils/kbars';
 import { roundToTick } from '../lib/utils/ticksize';
 import * as styles from './candle-chart.css';
-import { ChartDrawingTools } from './chart-drawing-tools';
+import { ChartDrawingOverlays, ChartDrawingTools, ChartObjectList } from './chart-drawing-tools';
+import { toolDef } from '../lib/chart-drawings';
 import { Orb } from './orb';
 import { AsyncStatus } from './async-status';
 import * as panel from './panel.css';
@@ -773,6 +779,8 @@ export function CandleChart({
             });
 
         const hitAt = (e: MouseEvent) => {
+            // 畫圖的浮動工具列／文字框蓋在標籤上時，那一下屬於它們
+            if ((e.target as HTMLElement | null)?.closest?.('[data-drawing-overlay]')) return null;
             // 標籤都貼在價格軸旁（等同把手區），但武裝畫圖工具、或游標下是
             // 選取中的畫圖物件時，這一下歸畫圖（見 orderLineMayTakePointer）
             const d = drawingsRef.current;
@@ -983,6 +991,11 @@ export function CandleChart({
         tradeArmed: mode !== 'observe',
         onEnterDrawingMode: () => setMode('observe'),
         themeMode: baseMode(themeSettings),
+        getBars: () => barsRef.current,
+        // 量測換算損益：期貨／選擇權＝口數 × 乘數；股票＝張數 × 1000 股
+        // （零股＝股數）。不知道乘數時不顯示損益
+        pnlPerPoint: drawingPnlPerPoint(contract, orderMarket, orderSettings),
+        chartBackground: colors.labelBg,
     });
     drawingArmedRef.current = drawings.tool !== null;
     drawingsRef.current = drawings;
@@ -998,6 +1011,13 @@ export function CandleChart({
             body: '瀏覽器儲存空間已滿，新的畫圖只保留到關閉視窗為止。請刪除部分畫圖後再試。',
         });
     }, [drawingsSaveFailed]);
+
+    // 合併後超過上限、載入時截斷異常資料 — 不默默丟掉，告訴使用者
+    const drawingNotices = useDrawingNotices();
+    useEffect(() => {
+        if (!drawingNotices.length) return;
+        for (const body of takeDrawingNotices()) notify({ kind: 'err', title: '畫圖物件數量', body });
+    }, [drawingNotices]);
 
     // keep latest theme readable inside the chart-creation effect
     const themeSettingsRef = useRef(themeSettings);
@@ -2094,13 +2114,7 @@ export function CandleChart({
                 )}
                 {mode === 'observe' && drawings.tool && (
                     <div className={styles.drawHint}>
-                        畫圖模式 ·{' '}
-                        {drawings.tool === 'horizontal'
-                            ? '點擊價位放置水平線'
-                            : drawings.tool === 'box'
-                              ? '點兩下決定方框的兩個對角'
-                              : '點兩下決定起點與終點'}
-                        （Esc 取消）
+                        畫圖模式 · {toolDef(drawings.tool).label}：{DRAW_HINT[drawings.tool]}（Esc 取消）
                     </div>
                 )}
                 {(workingOrders.length > 0 ||
@@ -2233,8 +2247,36 @@ export function CandleChart({
                         </div>
                     );
                 })}
+                <ChartDrawingOverlays api={drawings} />
             </div>
+            <ChartObjectList api={drawings} />
             </div>
         </div>
     );
+}
+
+const DRAW_HINT: Record<string, string> = {
+    horizontal: '點擊價位放置水平線',
+    vertical: '點擊時間放置垂直線',
+    trend: '點兩下決定起點與終點',
+    ray: '點兩下決定起點與方向',
+    extended: '點兩下決定斜率',
+    channel: '點兩下畫基準線，第三下決定通道寬度',
+    box: '點兩下決定方框的兩個對角',
+    fib: '點兩下：起點（1）到終點（0）',
+    text: '點一下放置文字，輸入後按 Enter',
+    measure: '點兩下量測價差、K 棒數與時間',
+};
+
+function drawingPnlPerPoint(
+    contract: ContractBase,
+    market: ChartOrderMarket | null | undefined,
+    s: ChartOrderSettings,
+): number | null {
+    if (market === 'F') {
+        const mult = (contract as { multiplier?: number }).multiplier;
+        return mult && mult > 0 ? mult * s.qty : null;
+    }
+    if (market === 'S') return s.qty * (s.lot === 'IntradayOdd' ? 1 : 1000);
+    return null;
 }

@@ -9,26 +9,84 @@
 
 import { useSyncExternalStore } from 'react';
 import type { ContractBase } from './types/contract';
+import { defaultFibOptions, sanitizeFibOptions, type FibOptions } from './chart-drawing-fib';
 
 export type DrawingTool =
     | 'horizontal' // 水平線：單一價位，橫貫整個 pane
+    | 'vertical' // 垂直線：單一時間，縱貫整個 pane
     | 'trend' // 趨勢線：兩點之間的線段
     | 'ray' // 射線：由起點經第二點向右無限延伸
     | 'extended' // 延伸線：兩點決定斜率，向左右無限延伸
-    | 'box'; // 方框：兩個對角決定的矩形
+    | 'channel' // 平行通道：兩點決定基準線，第三點決定平行線的價差
+    | 'box' // 方框：兩個對角決定的矩形
+    | 'fib' // 斐波那契回撤：兩點（起點＝1、終點＝0）間的比例價位
+    | 'text'; // 文字註記：錨定在時間／價格上的文字框
 
-export const DRAWING_TOOLS: { tool: DrawingTool; label: string; hint: string }[] = [
-    { tool: 'horizontal', label: '水平線', hint: '支撐、壓力、前高前低（點一下）' },
-    { tool: 'trend', label: '趨勢線', hint: '兩點決定的線段' },
-    { tool: 'ray', label: '射線', hint: '由起點經第二點向右延伸' },
-    { tool: 'extended', label: '延伸線', hint: '兩點決定斜率，向左右延伸' },
-    { tool: 'box', label: '方框', hint: '兩個對角決定的區域' },
+// 工具列分組。部位工具（第二期）還沒有工具，工具列不顯示空的組。
+export type DrawingGroup = 'lines' | 'shapes' | 'fib' | 'notes' | 'measure' | 'position';
+
+export const DRAWING_GROUPS: { group: DrawingGroup; label: string }[] = [
+    { group: 'lines', label: '線條' },
+    { group: 'shapes', label: '形狀' },
+    { group: 'fib', label: '斐波那契' },
+    { group: 'notes', label: '文字註記' },
+    { group: 'measure', label: '量測' },
+    { group: 'position', label: '部位工具' },
 ];
 
-// 需要兩個控制點的工具；水平線只要一個
-export function anchorCount(tool: DrawingTool): 1 | 2 {
-    return tool === 'horizontal' ? 1 : 2;
+// 量測不是存下來的物件（量完就清），但在工具列上跟畫圖工具並列
+export type DrawingToolId = DrawingTool | 'measure';
+
+export interface DrawingToolDef {
+    tool: DrawingToolId;
+    group: DrawingGroup;
+    label: string;
+    hint: string;
+    // Alt＋字母（用 KeyboardEvent.code 判斷 — macOS 的 Option 會把
+    // e.key 變成特殊符號）
+    shortcut?: string;
 }
+
+export const DRAWING_TOOL_DEFS: DrawingToolDef[] = [
+    { tool: 'trend', group: 'lines', label: '趨勢線', hint: '兩點決定的線段', shortcut: 'T' },
+    { tool: 'ray', group: 'lines', label: '射線', hint: '由起點經第二點向右延伸' },
+    { tool: 'extended', group: 'lines', label: '延伸線', hint: '兩點決定斜率，向左右延伸' },
+    { tool: 'horizontal', group: 'lines', label: '水平線', hint: '支撐、壓力、前高前低（點一下）', shortcut: 'H' },
+    { tool: 'vertical', group: 'lines', label: '垂直線', hint: '標記時間點（點一下）', shortcut: 'V' },
+    { tool: 'channel', group: 'lines', label: '平行通道', hint: '兩點畫基準線，第三點決定通道寬度', shortcut: 'P' },
+    { tool: 'box', group: 'shapes', label: '方框', hint: '兩個對角決定的區域', shortcut: 'R' },
+    { tool: 'fib', group: 'fib', label: '斐波那契回撤', hint: '起點到終點的回撤比例價位', shortcut: 'F' },
+    { tool: 'text', group: 'notes', label: '文字註記', hint: '點一下放置文字，雙擊可編輯', shortcut: 'N' },
+    { tool: 'measure', group: 'measure', label: '價差量測', hint: '點兩下量點數、漲跌幅、K 棒數與時間（Esc 或點一下清除）', shortcut: 'M' },
+];
+
+export function toolDef(tool: DrawingToolId): DrawingToolDef {
+    return DRAWING_TOOL_DEFS.find((d) => d.tool === tool)!;
+}
+
+// 存下來的物件工具（不含量測）
+export const DRAWING_TOOLS = DRAWING_TOOL_DEFS.filter(
+    (d): d is DrawingToolDef & { tool: DrawingTool } => d.tool !== 'measure',
+);
+
+export function isDrawingTool(v: unknown): v is DrawingTool {
+    return typeof v === 'string' && DRAWING_TOOLS.some((t) => t.tool === v);
+}
+
+// 每種工具的控制點數
+export function anchorCount(tool: DrawingToolId): 1 | 2 | 3 {
+    switch (tool) {
+        case 'horizontal':
+        case 'vertical':
+        case 'text':
+            return 1;
+        case 'channel':
+            return 3;
+        default:
+            return 2;
+    }
+}
+
 
 export interface DrawingAnchor {
     time: number; // UTC 秒（與 lightweight-charts 的 UTCTimestamp 同一刻度）
@@ -39,8 +97,20 @@ export interface DrawingStyle {
     color: string; // 線色（#rrggbb）
     width: number; // 線寬 1–4
     dash: 'solid' | 'dashed';
-    fillOpacity: number; // 方框填色透明度 0–1（其他工具不使用）
+    fillOpacity: number; // 方框／通道的填色透明度 0–1
+    // 線條（與文字）的不透明度 0.1–1：蓋在 K 棒上時可以半透明，不把 K 棒
+    // 擋住。舊資料沒有這個欄位，載入時補 1（外觀不變）
+    opacity: number;
 }
+
+export const MIN_LINE_OPACITY = 0.1;
+
+// 新物件線條的預設不透明度：略透明，蓋在 K 棒上仍看得到 K 棒；淺色底上
+// 同樣的透明度看起來較淡，所以淺色主題稍微不透明一點
+export const DEFAULT_LINE_OPACITY: Record<'dark' | 'light', number> = {
+    dark: 0.85,
+    light: 0.9,
+};
 
 export interface Drawing {
     id: string;
@@ -53,6 +123,18 @@ export interface Drawing {
     // 最後修改時間：跨視窗合併時與刪除墓碑比較，較舊的修改不能讓已刪除
     // 的物件復活
     updatedAt: number;
+    name?: string; // 物件列表裡的名稱（沒設就用工具名稱）
+    text?: string; // 文字註記的內容
+    fib?: FibOptions; // 斐波那契的比例、色帶、標籤、延伸（沒設就用預設）
+}
+
+export const MAX_TEXT_LENGTH = 200;
+export const MAX_NAME_LENGTH = 40;
+
+export function drawingLabel(d: Pick<Drawing, 'tool' | 'name' | 'text'>): string {
+    if (d.name) return d.name;
+    if (d.tool === 'text' && d.text) return d.text.split('\n')[0]!.slice(0, 24);
+    return toolDef(d.tool).label;
 }
 
 // TradingView 風格的固定色盤 — 不跟主題走，使用者選什麼就是什麼，
@@ -86,6 +168,7 @@ export const DEFAULT_DRAWING_STYLE: DrawingStyle = {
     width: 2,
     dash: 'solid',
     fillOpacity: 0.08,
+    opacity: 1,
 };
 
 export type DrawingThemeMode = 'dark' | 'light';
@@ -98,22 +181,36 @@ export type DrawingThemeMode = 'dark' | 'light';
 export const TOOL_DEFAULT_COLORS: Record<DrawingThemeMode, Record<DrawingTool, string>> = {
     dark: {
         horizontal: '#ff7a2f',
+        vertical: '#ff7a2f',
         trend: '#9b87f5',
         ray: '#9b87f5',
         extended: '#9b87f5',
+        channel: '#9b87f5',
         box: '#9aa3b5',
+        fib: '#3bc9db',
+        text: '#b197fc',
     },
     light: {
         horizontal: '#e8590c',
+        vertical: '#e8590c',
         trend: '#6741d9',
         ray: '#6741d9',
         extended: '#6741d9',
+        channel: '#6741d9',
         box: '#6b7280',
+        fib: '#0c8599',
+        text: '#7048e8',
     },
 };
 
-// 新物件除了顏色以外的預設（線寬、線型、方框填色）
-export type DrawingBaseStyle = Omit<DrawingStyle, 'color'>;
+// 價差量測（暫時的覆蓋層，不存檔）的顏色
+export const MEASURE_COLORS: Record<DrawingThemeMode, string> = {
+    dark: '#4c8dff',
+    light: '#1c64f2',
+};
+
+// 新物件除了顏色、不透明度以外的預設（線寬、線型、方框填色）
+export type DrawingBaseStyle = Omit<DrawingStyle, 'color' | 'opacity'>;
 
 export interface DrawingSettings {
     // 期貨連續月（TXFR1）與月份合約（TXFI6）共用同一份畫圖。
@@ -124,6 +221,16 @@ export interface DrawingSettings {
     defaultStyle: DrawingBaseStyle;
     // 使用者挑過的顏色，依工具記住；沒挑過的工具用 TOOL_DEFAULT_COLORS
     toolColors: Partial<Record<DrawingTool, string>>;
+    // 磁吸：畫點與拖曳控制點時貼齊最近 K 棒的開高低收
+    magnet: boolean;
+    // ★ 釘在工具列上的工具
+    favorites: DrawingToolId[];
+    // 每組最後用的工具（組按鈕顯示它、點一下直接武裝它）
+    groupLast: Partial<Record<DrawingGroup, DrawingToolId>>;
+    // 右側物件列表是否展開
+    objectListOpen: boolean;
+    // 使用者挑過的線條不透明度；沒挑過依主題用 DEFAULT_LINE_OPACITY
+    lineOpacity?: number;
 }
 
 const DEFAULT_SETTINGS: DrawingSettings = {
@@ -134,6 +241,11 @@ const DEFAULT_SETTINGS: DrawingSettings = {
         fillOpacity: DEFAULT_DRAWING_STYLE.fillOpacity,
     },
     toolColors: {},
+    magnet: false,
+    // 預設不釘：工具列在預設版面（矮面板）要放得下全部分組與下方操作
+    favorites: [],
+    groupLast: {},
+    objectListOpen: false,
 };
 
 // 某個工具的下一個新物件樣式：使用者挑過的顏色優先，否則依主題取預設色
@@ -142,7 +254,11 @@ export function defaultStyleFor(
     tool: DrawingTool,
     mode: DrawingThemeMode,
 ): DrawingStyle {
-    return { ...s.defaultStyle, color: s.toolColors[tool] ?? TOOL_DEFAULT_COLORS[mode][tool] };
+    return {
+        ...s.defaultStyle,
+        color: s.toolColors[tool] ?? TOOL_DEFAULT_COLORS[mode][tool],
+        opacity: s.lineOpacity ?? DEFAULT_LINE_OPACITY[mode],
+    };
 }
 
 const STORAGE_KEY = 'sj-pro-chart-drawings';
@@ -202,11 +318,18 @@ function sanitizeBaseStyle(v: unknown, fallback: DrawingBaseStyle): DrawingBaseS
     return { width, dash, fillOpacity };
 }
 
+export function clampOpacity(v: unknown, fallback: number): number {
+    return typeof v === 'number' && Number.isFinite(v)
+        ? Math.min(1, Math.max(MIN_LINE_OPACITY, v))
+        : fallback;
+}
+
 export function sanitizeStyle(v: unknown, fallbackColor: string): DrawingStyle {
     const o = (v && typeof v === 'object' ? v : {}) as Record<string, unknown>;
     return {
         color: isDrawingColor(o.color) ? o.color : fallbackColor,
         ...sanitizeBaseStyle(o, DEFAULT_SETTINGS.defaultStyle),
+        opacity: clampOpacity(o.opacity, 1),
     };
 }
 
@@ -215,8 +338,8 @@ export function sanitizeDrawing(v: unknown): Drawing | null {
     if (!v || typeof v !== 'object') return null;
     const d = v as Record<string, unknown>;
     if (typeof d.id !== 'string' || !d.id || typeof d.tool !== 'string') return null;
-    const tool = DRAWING_TOOLS.find((t) => t.tool === d.tool)?.tool;
-    if (!tool) return null;
+    if (!isDrawingTool(d.tool)) return null;
+    const tool = d.tool;
     if (!Array.isArray(d.anchors) || d.anchors.length !== anchorCount(tool)) return null;
     const anchors: DrawingAnchor[] = [];
     for (const a of d.anchors as unknown[]) {
@@ -246,7 +369,19 @@ export function sanitizeDrawing(v: unknown): Drawing | null {
                 : typeof d.createdAt === 'number' && Number.isFinite(d.createdAt)
                   ? d.createdAt
                   : 0,
+        ...(typeof d.name === 'string' && d.name.trim()
+            ? { name: d.name.trim().slice(0, MAX_NAME_LENGTH) }
+            : {}),
+        ...(tool === 'text'
+            ? { text: typeof d.text === 'string' ? d.text.slice(0, MAX_TEXT_LENGTH) : '' }
+            : {}),
+        // #224 第一版的 levels（數字陣列）轉成新的 fib.levels
+        ...(tool === 'fib' ? { fib: sanitizeFibOptions(d.fib, d.levels) } : {}),
     };
+}
+
+export function fibOptionsOf(d: Pick<Drawing, 'fib'>): FibOptions {
+    return d.fib ?? defaultFibOptions();
 }
 
 export function sanitizeSettings(v: unknown): DrawingSettings {
@@ -259,6 +394,17 @@ export function sanitizeSettings(v: unknown): DrawingSettings {
             if (isDrawingColor(c)) toolColors[tool] = c;
         }
     }
+    const toolIds = new Set<string>(DRAWING_TOOL_DEFS.map((t) => t.tool));
+    const favorites = Array.isArray(o.favorites)
+        ? [...new Set(o.favorites.filter((t): t is DrawingToolId => typeof t === 'string' && toolIds.has(t)))]
+        : DEFAULT_SETTINGS.favorites;
+    const groupLast: Partial<Record<DrawingGroup, DrawingToolId>> = {};
+    if (o.groupLast && typeof o.groupLast === 'object') {
+        for (const def of DRAWING_TOOL_DEFS) {
+            const v = (o.groupLast as Record<string, unknown>)[def.group];
+            if (v === def.tool) groupLast[def.group] = def.tool;
+        }
+    }
     return {
         shareContinuousMonth:
             typeof o.shareContinuousMonth === 'boolean'
@@ -266,6 +412,13 @@ export function sanitizeSettings(v: unknown): DrawingSettings {
                 : DEFAULT_SETTINGS.shareContinuousMonth,
         defaultStyle: sanitizeBaseStyle(o.defaultStyle, DEFAULT_SETTINGS.defaultStyle),
         toolColors,
+        magnet: o.magnet === true,
+        favorites,
+        groupLast,
+        objectListOpen: o.objectListOpen === true,
+        ...(typeof o.lineOpacity === 'number' && Number.isFinite(o.lineOpacity)
+            ? { lineOpacity: clampOpacity(o.lineOpacity, 1) }
+            : {}),
     };
 }
 
@@ -312,17 +465,40 @@ export function stamp(): number {
     return lastStamp;
 }
 
-// 每個商品只留最新的 MAX_DRAWINGS_PER_SYMBOL 個（依建立時間），順序不變
-export function capDrawings(list: Drawing[]): Drawing[] {
-    if (list.length <= MAX_DRAWINGS_PER_SYMBOL) return list;
+// 載入時的硬上限：只擋損壞或異常巨大的資料（正常使用最多到軟上限
+// MAX_DRAWINGS_PER_SYMBOL 附近）。超過時保留最新的 HARD_MAX 個並通知
+export const HARD_MAX_DRAWINGS_PER_SYMBOL = 1000;
+
+export function capDrawings(list: Drawing[], max = HARD_MAX_DRAWINGS_PER_SYMBOL): Drawing[] {
+    if (list.length <= max) return list;
     const keep = new Set(
         [...list]
             .sort((x, y) => y.createdAt - x.createdAt)
-            .slice(0, MAX_DRAWINGS_PER_SYMBOL)
+            .slice(0, max)
             .map((d) => d.id),
     );
     return list.filter((d) => keep.has(d.id));
 }
+
+// 給 UI 顯示的通知（合併後超過上限、載入時截斷異常資料）
+let notices: string[] = [];
+const noticed = new Set<string>(); // 同一則只通知一次（載入／同步會重跑）
+function noteDrawings(msg: string) {
+    if (noticed.has(msg)) return;
+    noticed.add(msg);
+    notices = [...notices, msg];
+    // 在 module 初始化期間 listeners 還是空的，emit 無副作用
+    for (const l of listeners) l();
+}
+export function takeDrawingNotices(): string[] {
+    const out = notices;
+    if (out.length) notices = [];
+    return out;
+}
+export function useDrawingNotices(): readonly string[] {
+    return useSyncExternalStore(subscribe, () => notices, () => EMPTY_NOTICES);
+}
+const EMPTY_NOTICES: string[] = [];
 
 function loadStore(tombs: Tombs = loadTombs()): Store {
     try {
@@ -341,7 +517,12 @@ function loadStore(tombs: Tombs = loadTombs()): Store {
                 seen.add(d.id);
                 clean.push(d);
             }
-            // 上限在載入時也要守住 — 超量的舊資料每次重繪、命中判定都要掃
+            // 硬上限只擋損壞／異常巨大的資料；正常的軟上限超量不在這裡刪
+            if (clean.length > HARD_MAX_DRAWINGS_PER_SYMBOL) {
+                noteDrawings(
+                    `${key} 的畫圖資料有 ${clean.length} 筆，超過 ${HARD_MAX_DRAWINGS_PER_SYMBOL} 筆，已只載入最新的 ${HARD_MAX_DRAWINGS_PER_SYMBOL} 筆。`,
+                );
+            }
             if (clean.length) out[key] = capDrawings(clean);
         }
         return out;
@@ -376,6 +557,7 @@ interface Journal {
     name: string; // localStorage 項目名稱
     raw: string; // 讀到的原始內容：刪除前比對，只刪「併進去的那一版」
     ops: Map<string, Map<string, Drawing | number>>;
+    order: Map<string, string[]>; // 關窗前調整過的圖層順序
     settings: Partial<DrawingSettings>;
 }
 
@@ -400,6 +582,7 @@ function loadJournals(): Journal[] {
             if (text === null) continue;
             const raw = JSON.parse(text) as {
                 ops?: Record<string, Record<string, unknown>>;
+                order?: Record<string, unknown>;
                 settings?: Record<string, unknown>;
             } | null;
             if (!raw || typeof raw !== 'object') continue;
@@ -418,7 +601,11 @@ function loadJournals(): Journal[] {
             }
             const settingsPatch =
                 raw.settings && typeof raw.settings === 'object' ? (raw.settings as Partial<DrawingSettings>) : {};
-            out.push({ name, raw: text, ops, settings: settingsPatch });
+            const order = new Map<string, string[]>();
+            for (const [key, ids] of Object.entries(raw.order ?? {})) {
+                if (Array.isArray(ids)) order.set(key, ids.filter((x): x is string => typeof x === 'string'));
+            }
+            out.push({ name, raw: text, ops, order, settings: settingsPatch });
         } catch {
             // 壞掉的日誌略過（寫入者會把它刪掉）
         }
@@ -427,7 +614,7 @@ function loadJournals(): Journal[] {
 }
 
 function applyJournals(base: Store, tombs: Tombs, journals: Journal[]): Store {
-    return journals.reduce((acc, j) => applyOps(acc, j.ops, tombs), base);
+    return journals.reduce((acc, j) => applyOps(acc, j.ops, tombs, j.order), base);
 }
 
 // 主項目＋所有日誌（讀取時看到的樣子）
@@ -461,6 +648,8 @@ function emit() {
 // 較晚修改（updatedAt）的一方勝出；刪除比修改晚就維持刪除。
 type Op = Drawing | number; // number＝刪除時間
 const pending = new Map<string, Map<string, Op>>();
+// 本視窗調整過圖層順序的商品：記下想要的 id 順序，疊上對方版本時照排
+const pendingOrder = new Map<string, string[]>();
 
 function record(key: string, id: string, op: Op) {
     let ops = pending.get(key);
@@ -471,8 +660,13 @@ function record(key: string, id: string, op: Op) {
     ops.set(id, op);
 }
 
-function applyOps(base: Store, ops: Map<string, Map<string, Op>>, tombs: Tombs): Store {
-    if (!ops.size) return base;
+function applyOps(
+    base: Store,
+    ops: Map<string, Map<string, Op>>,
+    tombs: Tombs,
+    order: Map<string, string[]> = pendingOrder,
+): Store {
+    if (!ops.size && !order.size) return base;
     const out: Store = { ...base };
     for (const [key, byId] of ops) {
         const list = [...(out[key] ?? [])];
@@ -483,16 +677,35 @@ function applyOps(base: Store, ops: Map<string, Map<string, Op>>, tombs: Tombs):
                 const t = (tombs[key] ??= {});
                 t[id] = Math.max(t[id] ?? 0, op);
             } else if (buried(tombs, key, op)) {
-                // 別的視窗在本視窗修改之後刪掉了它 — 維持刪除
-                if (i >= 0) list.splice(i, 1);
+                // 別的視窗在本視窗修改之後刪掉了它 — 這筆（較舊的）修改作廢。
+                // 主項目裡同 id 的版本只有「不比刪除新」時才跟著移除；比刪除
+                // 還新的版本是刪除之後重建／復原的，要保留
+                const at = tombs[key]![id]!;
+                if (i >= 0 && list[i]!.updatedAt <= at) list.splice(i, 1);
             } else if (i >= 0) {
                 if (list[i]!.updatedAt <= op.updatedAt) list[i] = op;
             } else {
                 list.push(op);
             }
         }
-        if (list.length) out[key] = capDrawings(list);
+        // 合併時不刪使用者的物件：兩個視窗各自在 199 個時再加一個，合併
+        // 後暫時超過上限（軟上限）— 通知使用者，新增在 UI 端擋住
+        if (list.length > MAX_DRAWINGS_PER_SYMBOL && (base[key]?.length ?? 0) <= MAX_DRAWINGS_PER_SYMBOL) {
+            noteDrawings(
+                `${key} 的畫圖物件合併後有 ${list.length} 個，超過 ${MAX_DRAWINGS_PER_SYMBOL} 個上限；刪除部分物件之前無法再新增。`,
+            );
+        }
+        if (list.length) out[key] = list;
         else delete out[key];
+    }
+    for (const [key, ord] of order) {
+        const list = out[key];
+        if (!list) continue;
+        const rank = new Map(ord.map((id, i) => [id, i]));
+        // 本視窗排過的依本視窗順序；對方新加的（不在排序裡）保持在原位之後
+        const known = list.filter((d) => rank.has(d.id)).sort((a, b) => rank.get(a.id)! - rank.get(b.id)!);
+        const unknown = list.filter((d) => !rank.has(d.id));
+        out[key] = [...known, ...unknown];
     }
     return out;
 }
@@ -562,10 +775,11 @@ let settingsTimer: ReturnType<typeof setTimeout> | null = null;
 // 新改動的物件保留在 pending，下一輪再寫
 function writeDrawingsNow() {
     const journals = loadJournals();
-    if (!pending.size && !journals.length) return;
+    if (!pending.size && !pendingOrder.size && !journals.length) return;
     const snapshot = new Map([...pending].map(([k, ops]) => [k, new Map(ops)]));
+    const orderSnap = new Map(pendingOrder);
     const tombs = loadTombs();
-    const next = applyOps(loadView(tombs, journals), snapshot, tombs);
+    const next = applyOps(loadView(tombs, journals), snapshot, tombs, orderSnap);
     const journalSettings = journals.filter((j) => Object.keys(j.settings).length);
     const now = Date.now();
     for (const [key, ids] of Object.entries(tombs)) {
@@ -600,6 +814,7 @@ function writeDrawingsNow() {
         for (const [id, op] of ops) if (cur.get(id) === op) cur.delete(id);
         if (!cur.size) pending.delete(key);
     }
+    for (const [key, order] of orderSnap) if (pendingOrder.get(key) === order) pendingOrder.delete(key);
     if (saveError) {
         saveError = false;
         emit();
@@ -611,7 +826,7 @@ export function flushDrawingWrites() {
         clearTimeout(writeTimer);
         writeTimer = null;
     }
-    if (!pending.size && !journalNames().length) return;
+    if (!pending.size && !pendingOrder.size && !journalNames().length) return;
     withLock(writeDrawingsNow);
 }
 
@@ -659,16 +874,18 @@ export function writeDrawingJournal() {
     if (settingsTimer !== null) clearTimeout(settingsTimer);
     writeTimer = null;
     settingsTimer = null;
-    if (!pending.size && !pendingSettingKeys.size) return;
+    if (!pending.size && !pendingOrder.size && !pendingSettingKeys.size) return;
     // 每次都寫新的項目名稱（時間＋視窗＋序號）：bfcache 回來後又改了東西
     // 再關一次時，另一個視窗正在合併、準備刪除的舊日誌不會連新內容一起
     // 被刪掉。名稱以時間開頭，依名稱排序就是寫入順序
     const name = `${JOURNAL_PREFIX}${Date.now().toString(36).padStart(9, '0')}:${WINDOW_ID}:${++journalSeq}`;
     const ops: Record<string, Record<string, Drawing | number>> = {};
     for (const [key, byId] of pending) ops[key] = Object.fromEntries(byId);
+    const order: Record<string, string[]> = Object.fromEntries(pendingOrder);
     const journal = {
         at: Date.now(),
         ops,
+        order,
         settings: pickSettings(settings, pendingSettingKeys),
     };
     try {
@@ -677,6 +894,7 @@ export function writeDrawingJournal() {
         return; // 配額滿：已經在關窗，沒有別的地方可放
     }
     pending.clear();
+    pendingOrder.clear();
     pendingSettingKeys.clear();
 }
 
@@ -771,6 +989,7 @@ export function addDrawing(
     tool: DrawingTool,
     anchors: DrawingAnchor[],
     style: DrawingStyle,
+    extra?: Pick<Drawing, 'text' | 'fib' | 'name'>,
 ): Drawing | null {
     if ((store[key]?.length ?? 0) >= MAX_DRAWINGS_PER_SYMBOL) return null;
     const now = stamp();
@@ -783,6 +1002,9 @@ export function addDrawing(
         hidden: false,
         createdAt: now,
         updatedAt: now,
+        ...(extra?.name ? { name: extra.name } : {}),
+        ...(tool === 'text' ? { text: extra?.text ?? '' } : {}),
+        ...(tool === 'fib' ? { fib: sanitizeFibOptions(extra?.fib ?? defaultFibOptions()) } : {}),
     };
     store = { ...store, [key]: [...(store[key] ?? []), drawing] };
     record(key, drawing.id, drawing);
@@ -804,8 +1026,57 @@ function commit(key: string, nextIn: Drawing[]) {
         record(key, d.id, stamped);
         return stamped;
     });
+    // 共同物件的相對順序變了（調整圖層）— 記下想要的順序
+    const common = (list: Drawing[], other: Map<string, unknown> | Set<string>) =>
+        list.filter((d) => other.has(d.id)).map((d) => d.id);
+    const a = common(before, ids);
+    const b = common(next, prev);
+    if (a.length !== b.length || a.some((id, i) => id !== b[i])) {
+        pendingOrder.set(key, next.map((d) => d.id));
+    }
     store = { ...store, [key]: next };
     persist();
+}
+
+// 整份換掉（復原／重做、多選操作）— 依物件記錄差異，跨視窗照樣合併
+export function replaceDrawings(key: string, next: Drawing[]) {
+    const before = store[key] ?? EMPTY;
+    if (before === next) return;
+    commit(key, next);
+}
+
+// 調整圖層：把 id 移到 toIndex（陣列尾端＝最上層）
+export function moveDrawing(key: string, id: string, toIndex: number) {
+    const list = store[key];
+    const from = list?.findIndex((d) => d.id === id) ?? -1;
+    if (!list || from < 0) return;
+    const to = Math.max(0, Math.min(list.length - 1, toIndex));
+    if (to === from) return;
+    const next = [...list];
+    const [item] = next.splice(from, 1);
+    next.splice(to, 0, item!);
+    commit(key, next);
+}
+
+// 全部鎖定／解鎖（ids 省略＝整個商品）
+export function setDrawingsLocked(key: string, locked: boolean, ids?: readonly string[]) {
+    const list = store[key];
+    if (!list) return;
+    const pick = ids ? new Set(ids) : null;
+    if (!list.some((d) => (!pick || pick.has(d.id)) && d.locked !== locked)) return;
+    commit(
+        key,
+        list.map((d) => ((!pick || pick.has(d.id)) && d.locked !== locked ? { ...d, locked } : d)),
+    );
+}
+
+// 一次刪多個（多選刪除）；鎖定的保留
+export function removeDrawings(key: string, ids: readonly string[]) {
+    const list = store[key];
+    if (!list) return;
+    const drop = new Set(ids);
+    const next = list.filter((d) => !drop.has(d.id) || d.locked);
+    if (next.length !== list.length) commit(key, next);
 }
 
 export function updateDrawing(key: string, id: string, patch: Partial<Omit<Drawing, 'id'>>) {
@@ -835,7 +1106,11 @@ export function duplicateDrawing(
 ): Drawing | null {
     const source = (store[key] ?? []).find((d) => d.id === id);
     if (!source) return null;
-    return addDrawing(key, source.tool, source.anchors.map(shift), source.style);
+    return addDrawing(key, source.tool, source.anchors.map(shift), source.style, {
+        text: source.text,
+        fib: source.fib,
+        name: source.name,
+    });
 }
 
 // 隱藏的物件點不到，取消選取後就只能從這裡找回來
@@ -865,7 +1140,10 @@ export function __resetDrawingsForTest() {
     writeTimer = null;
     settingsTimer = null;
     pending.clear();
+    pendingOrder.clear();
     pendingSettingKeys.clear();
+    notices = [];
+    noticed.clear();
     lockOverride = null;
     saveError = false;
     saveErrorNoticePending = false;
